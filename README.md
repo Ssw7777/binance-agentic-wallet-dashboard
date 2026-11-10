@@ -21,7 +21,7 @@ It brings multiple Agentic wallets into one operational view: portfolio balances
 - **Risk filtering** — hides dust, low-liquidity, honeypot, and high-tax tokens by default; the filter details are collapsible.
 - **Trading tax visibility** — buy/sell tax is shown in the holdings table and sell flow; a second confirmation is required above 10% sell tax.
 - **Background keepalive** — hourly `baw wallet status` for each session, with a green/red status entry in the header.
-- **Single-page layout** — compact desktop layout, responsive fallback for smaller screens.
+- **Desktop + phone layout** — compact desktop view; phone portrait cards and landscape breakpoints for small screens.
 
 ---
 
@@ -81,7 +81,7 @@ pip install -r requirements.txt
 ## Quick start
 
 ```bash
-git clone https://github.com/Ssw7777/binance-agentic-wallet-dashboard.git
+git clone https://github.com/<your-account>/binance-agentic-wallet-dashboard.git
 cd binance-agentic-wallet-dashboard
 
 python3 -m venv .venv
