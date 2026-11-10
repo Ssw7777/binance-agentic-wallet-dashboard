@@ -2,8 +2,6 @@
 
 **Binance Agentic 钱包自托管看板｜中文优先**
 
-> 面向中国用户的双语说明。中文在前，English version below.
->
 > 本项目是独立自托管工具，不是 Binance 官方产品，与 Binance 无隶属关系。
 
 ---
@@ -127,6 +125,202 @@ python3 server.py
 ```
 
 `address` 必须是该 BAW 会话对应的真实 BSC 地址。示例文件故意使用空钱包列表。
+
+## 部署到 VPS（推荐：长期后台运行）
+
+> 目标：部署在 VPS 上，24 小时可访问；服务器重启后自动启动；不需要你本地电脑开机。
+
+下面以 Ubuntu 24.04、域名 `wallet.example.com`、运行用户 `ubuntu` 为例。
+
+### 1. 准备 VPS 和域名
+
+- 一台 1 核 1G 以上的 Linux VPS
+- Ubuntu **24.04**（自带 Python 3.12；22.04 需要自行安装 Python 3.12）
+- 域名 A 记录指向 VPS 公网 IP
+- 安装 Caddy（用于 HTTPS 和反向代理）
+- 按 Binance Agentic Wallet 官方方式安装 `baw`，确认 `baw --version` 可用
+
+```bash
+sudo apt update
+sudo apt install -y python3 python3-venv python3-pip git curl ufw
+```
+
+Caddy 请通过官方 apt 源安装，安装后确认：
+
+```bash
+caddy version
+```
+
+### 2. 拉取项目并安装依赖
+
+```bash
+sudo mkdir -p /opt/binance-agentic-wallet
+sudo chown "$USER":"$USER" /opt/binance-agentic-wallet
+
+git clone https://github.com/Ssw7777/binance-agentic-wallet-dashboard.git /opt/binance-agentic-wallet
+cd /opt/binance-agentic-wallet
+
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -r requirements.txt
+
+mkdir -p data
+cp config/wallets.example.json data/wallets.json
+```
+
+### 3. 登录 BAW 会话
+
+每个钱包一个独立会话目录：
+
+```bash
+export BINANCE_BAW_DIR="$HOME/aw/w1"
+baw auth signin
+
+export BINANCE_BAW_DIR="$HOME/aw/w2"
+baw auth signin
+```
+
+重复到所有钱包都登录完成。二维码登录需要在币安 App 确认。
+
+### 4. 先手动启动测试
+
+```bash
+cd /opt/binance-agentic-wallet
+. .venv/bin/activate
+python3 server.py
+```
+
+另开一个终端：
+
+```bash
+curl http://127.0.0.1:8100/api/health
+```
+
+看到正常 JSON 后，按 `Ctrl+C` 停止。服务只监听 `127.0.0.1:8100`，不要直接开放这个端口。
+
+### 5. 用 systemd 常驻 + 开机自启
+
+项目已提供 `deploy/agentic-wallet.service`：
+
+```bash
+sudo cp deploy/agentic-wallet.service /etc/systemd/system/agentic-wallet.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now agentic-wallet
+```
+
+检查状态和日志：
+
+```bash
+systemctl status agentic-wallet
+journalctl -u agentic-wallet -f
+```
+
+关键配置：
+
+- `Restart=always`：进程异常退出会自动拉起
+- `systemctl enable`：VPS 重启后自动启动
+- `ReadWritePaths`：只允许写 `data/` 和 `~/aw/`
+- `UMask=0077`：数据文件默认仅服务用户可读
+
+如果你的用户名不是 `ubuntu`，请同步修改 service 文件里的 `User`、`Group`、`HOME`、`WorkingDirectory` 和 `ReadWritePaths`。
+
+### 6. 配置域名、HTTPS 和登录鉴权
+
+**本项目没有内置登录系统**，必须加鉴权。
+
+#### 方案 A：独立子域名（最简单）
+
+```caddyfile
+wallet.example.com {
+    encode zstd gzip
+
+    # 必须加鉴权：forward_auth / SSO / VPN / basic_auth 任选一种
+    basic_auth {
+        admin <用 caddy hash-password 生成的密码哈希>
+    }
+
+    reverse_proxy 127.0.0.1:8100
+}
+```
+
+生成密码哈希：
+
+```bash
+caddy hash-password
+```
+
+把输出填到 `basic_auth` 里。更推荐把 `basic_auth` 换成你现有的 forward-auth / SSO / VPN。
+
+```bash
+sudo systemctl reload caddy
+```
+
+访问：`https://wallet.example.com/`
+
+#### 方案 B：挂到现有网站的 `/agentic/` 路径
+
+如果已有网站 `https://example.com`，可以在现有 Caddy site block 中加入：
+
+```caddyfile
+example.com {
+    # ...你原有的站点配置...
+
+    redir /agentic /agentic/ 308
+
+    handle_path /agentic/* {
+        # 这里也建议复用你原有的 forward_auth / SSO
+        reverse_proxy 127.0.0.1:8100
+    }
+}
+```
+
+访问：`https://example.com/agentic/`
+
+注意：
+
+- 必须保留结尾斜杠 `/agentic/`
+- `handle_path` 会去掉 `/agentic` 前缀，后端才能收到 `/api/*`
+- 前端使用相对路径 `api/...`，所以子路径部署可以正常工作
+- 不要配置成把 `/agentic` 原样转给后端，否则 API 会 404
+
+### 7. 防火墙
+
+```bash
+sudo ufw allow 22/tcp
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+sudo ufw enable
+```
+
+**不要开放 8100 端口。** 只允许 Caddy 在本机访问它。
+
+### 8. 更新版本
+
+```bash
+cd /opt/binance-agentic-wallet
+git pull
+. .venv/bin/activate
+pip install -r requirements.txt
+sudo systemctl restart agentic-wallet
+```
+
+### 9. 备份和会话过期
+
+- 备份 `data/`（钱包配置、历史缓存、审计记录）
+- 备份 `~/aw/` 前先确认权限；里面是 BAW 会话，属于敏感数据
+- Binance 会话过期时，手机 App 重新扫码登录对应 `wN`
+- 保活每小时执行一次 `baw wallet status`，但**不能代替币安自身的登录有效期**
+- 不要把 `data/`、`~/aw/`、Cookie、密码或二维码截图提交到 GitHub
+
+### 10. 常驻运行检查清单
+
+- [ ] `systemctl is-enabled agentic-wallet` 返回 `enabled`
+- [ ] `systemctl is-active agentic-wallet` 返回 `active`
+- [ ] `curl http://127.0.0.1:8100/api/health` 返回 200
+- [ ] 域名 HTTPS 正常
+- [ ] 未登录访问会被鉴权拦截
+- [ ] 8100 没有对公网开放
+- [ ] 服务器重启后页面仍能打开
 
 ## 反向代理和鉴权
 
@@ -325,6 +519,169 @@ Wallets can also be configured directly:
 ```
 
 The example file intentionally contains an empty wallet list.
+
+## Deploy on a VPS (recommended, always-on)
+
+> Goal: run on a VPS 24/7, survive reboots, and not depend on your laptop being powered on.
+
+Example assumptions: Ubuntu 24.04, domain `wallet.example.com`, Linux user `ubuntu`.
+
+### 1. Prepare the host
+
+- Linux VPS with at least 1 CPU / 1 GB RAM
+- Ubuntu 24.04 includes Python 3.12; Ubuntu 22.04 requires a separate Python 3.12 install
+- DNS A record for the dashboard domain
+- Caddy installed from the official apt repository
+- `baw` installed and authenticated; verify with `baw --version`
+
+```bash
+sudo apt update
+sudo apt install -y python3 python3-venv python3-pip git curl ufw
+```
+
+### 2. Install the app
+
+```bash
+sudo mkdir -p /opt/binance-agentic-wallet
+sudo chown "$USER":"$USER" /opt/binance-agentic-wallet
+
+git clone https://github.com/Ssw7777/binance-agentic-wallet-dashboard.git /opt/binance-agentic-wallet
+cd /opt/binance-agentic-wallet
+
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -r requirements.txt
+
+mkdir -p data
+cp config/wallets.example.json data/wallets.json
+```
+
+### 3. Authenticate BAW sessions
+
+```bash
+export BINANCE_BAW_DIR="$HOME/aw/w1"
+baw auth signin
+
+export BINANCE_BAW_DIR="$HOME/aw/w2"
+baw auth signin
+```
+
+Repeat for every wallet. Confirm each login in the Binance App.
+
+### 4. Smoke test
+
+```bash
+cd /opt/binance-agentic-wallet
+. .venv/bin/activate
+python3 server.py
+```
+
+In another shell:
+
+```bash
+curl http://127.0.0.1:8100/api/health
+```
+
+Stop with `Ctrl+C` after a successful response. The server binds to `127.0.0.1:8100` only.
+
+### 5. Run as a systemd service (auto-start on boot)
+
+```bash
+sudo cp deploy/agentic-wallet.service /etc/systemd/system/agentic-wallet.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now agentic-wallet
+```
+
+```bash
+systemctl status agentic-wallet
+journalctl -u agentic-wallet -f
+```
+
+The supplied unit uses `Restart=always`, `UMask=0077`, and restricts writes to `data/` and `~/aw/`. Adjust `User`, `Group`, `HOME`, `WorkingDirectory`, and `ReadWritePaths` if your user or paths differ.
+
+### 6. Domain, HTTPS, and authentication
+
+The app has **no built-in login**. Add authentication in front of it.
+
+#### Option A: dedicated subdomain
+
+```caddyfile
+wallet.example.com {
+    encode zstd gzip
+
+    # Replace with forward-auth / SSO / VPN or basic_auth.
+    basic_auth {
+        admin <hash generated by caddy hash-password>
+    }
+
+    reverse_proxy 127.0.0.1:8100
+}
+```
+
+```bash
+caddy hash-password
+sudo systemctl reload caddy
+```
+
+Open `https://wallet.example.com/`.
+
+#### Option B: existing website at `/agentic/`
+
+```caddyfile
+example.com {
+    # ...your existing site configuration...
+
+    redir /agentic /agentic/ 308
+
+    handle_path /agentic/* {
+        # Reuse your existing forward_auth / SSO here.
+        reverse_proxy 127.0.0.1:8100
+    }
+}
+```
+
+Open `https://example.com/agentic/`.
+
+Requirements: keep the trailing slash; let `handle_path` strip `/agentic` so the backend receives `/api/*`; do not proxy `/agentic` unchanged or the API will 404.
+
+### 7. Firewall
+
+```bash
+sudo ufw allow 22/tcp
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+sudo ufw enable
+```
+
+Do **not** expose port 8100 to the internet.
+
+### 8. Updates
+
+```bash
+cd /opt/binance-agentic-wallet
+git pull
+. .venv/bin/activate
+pip install -r requirements.txt
+sudo systemctl restart agentic-wallet
+```
+
+### 9. Backups and session expiry
+
+- Back up `data/` (wallet config, history cache, audit log).
+- Treat `~/aw/` as sensitive BAW session state.
+- Re-scan the Binance App QR when a session expires.
+- Hourly keepalive runs `baw wallet status`; it does not replace Binance login expiry.
+- Never commit `data/`, `~/aw/`, cookies, passwords, or QR screenshots.
+
+### 10. Always-on checklist
+
+- [ ] `systemctl is-enabled agentic-wallet` → `enabled`
+- [ ] `systemctl is-active agentic-wallet` → `active`
+- [ ] `curl http://127.0.0.1:8100/api/health` → 200
+- [ ] HTTPS domain works
+- [ ] Unauthenticated access is blocked
+- [ ] Port 8100 is not publicly reachable
+- [ ] The dashboard still loads after a VPS reboot
 
 ## Reverse proxy and auth
 
