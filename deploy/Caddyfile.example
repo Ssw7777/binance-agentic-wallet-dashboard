@@ -1,0 +1,10 @@
+# Example only. The app has no built-in authentication.
+# Put this behind forward-auth / SSO / VPN before exposing it.
+wallet.example.com {
+    redir /agentic /agentic/ 308
+
+    handle_path /agentic/* {
+        # Add forward_auth here in production.
+        reverse_proxy 127.0.0.1:8100
+    }
+}

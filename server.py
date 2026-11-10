@@ -1,0 +1,1508 @@
+#!/usr/bin/env python3
+"""0xStudy Agentic 钱包简易 — BSC 资产 / 一键卖出 / 发送 / 记录.
+
+Runs on 127.0.0.1:8100 behind Caddy. It shells out to the Binance Agentic
+Wallet CLI (baw) using each wallet's own BINANCE_BAW_DIR. No key material is
+stored or returned here.
+"""
+from __future__ import annotations
+
+import io
+import json
+import os
+import re
+import subprocess
+import threading
+import time
+import traceback
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from decimal import Decimal, ROUND_DOWN
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parent
+DATA = ROOT / "data"
+DATA.mkdir(exist_ok=True)
+HOME = Path(os.path.expanduser("~"))
+BAW = str(HOME / "agent" / "npm-global" / "bin" / "baw")
+PATH = f"{HOME}/agent/node/bin:{HOME}/agent/npm-global/bin:" + os.environ.get("PATH", "")
+PORT = 8100
+CHAIN = "56"
+NATIVE = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+USDT = "0x55d398326f99059ff775485246999027b3197955"
+WBNB = "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c"
+BSC_RPCS = [
+    "https://bsc-dataseed.binance.org/",
+    "https://bsc-rpc.publicnode.com",
+    "https://bsc-dataseed1.defibit.io/",
+    "https://1rpc.io/bnb",
+]
+DEX_TOKENS = "https://api.dexscreener.com/latest/dex/tokens/"
+HONEYPOT = "https://api.honeypot.is/v2/IsHoneypot"
+
+DEFAULT_WALLETS: list[dict[str, Any]] = []
+COLORS = ["#d4654a", "#4f6f9f", "#7c6a9f", "#2f8f7a", "#b07a12", "#a35476", "#3f6294"]
+WALLETS: list[dict[str, Any]] = []
+WALLET_BY_ID: dict[str, dict[str, Any]] = {}
+CONFIG_PATH = DATA / "wallets.json"
+_config_lock = threading.RLock()
+_next_slot = 7
+
+_cache_lock = threading.RLock()
+_balance_refresh_lock = threading.Lock()
+_balance_cache: dict[str, Any] = {"ts": 0.0, "wallets": {}}
+_market_cache: dict[str, Any] = {"ts": 0.0, "data": {}}
+BALANCE_PATH = DATA / "balance-cache.json"
+MARKET_PATH = DATA / "market-cache.json"
+_audit_cache: dict[str, dict[str, Any]] = {}
+_history_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+HISTORY_DIR = DATA / "history"
+HISTORY_DIR.mkdir(exist_ok=True)
+_history_refreshing: set[str] = set()
+_history_refresh_lock = threading.Lock()
+_task_lock = threading.RLock()
+_tasks: dict[str, dict[str, Any]] = {}
+_keepalive: dict[str, Any] = {"wallets": {}, "at": None}
+_wallet_locks: dict[str, threading.Lock] = {}
+_audit_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="audit")
+_baw_pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="baw")
+_pending_wallets: dict[str, dict[str, Any]] = {}
+_last_dex_error: str | None = None
+
+RISK_CONFIRM_RE = re.compile(
+    r"(confirm|verification|risk control|2fa|authenticator|binance app|"
+    r"风控|确认|验证|审核|待确认)",
+    re.I,
+)
+RISK_BLOCK_RE = re.compile(r"(locked|tx-lock|交易锁|trading disabled|暂停交易)", re.I)
+
+
+def now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime())
+
+
+def _apply_wallets(items: list[dict[str, Any]]) -> None:
+    global WALLETS, WALLET_BY_ID, _wallet_locks
+    clean: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in items:
+        wid = str(item.get("id") or "").strip()
+        if not re.fullmatch(r"w\d+", wid) or wid in seen:
+            continue
+        seen.add(wid)
+        clean.append({
+            "id": wid,
+            "label": str(item.get("label") or wid)[:30],
+            "agent": str(item.get("agent") or item.get("label") or wid)[:50],
+            "address": str(item.get("address") or ""),
+            "color": str(item.get("color") or COLORS[len(clean) % len(COLORS)]),
+            "trade": item.get("trade", True) is not False,
+        })
+    WALLETS = clean
+    WALLET_BY_ID = {w["id"]: w for w in clean}
+    for w in clean:
+        _wallet_locks.setdefault(w["id"], threading.Lock())
+
+
+def save_wallet_config() -> None:
+    with _config_lock:
+        payload = {"nextSlot": _next_slot, "wallets": WALLETS}
+        tmp = CONFIG_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(CONFIG_PATH)
+
+
+def load_wallet_config() -> None:
+    global _next_slot
+    with _config_lock:
+        if CONFIG_PATH.exists():
+            try:
+                payload = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+                items = payload.get("wallets")
+                _next_slot = max(7, int(payload.get("nextSlot") or 7))
+                if isinstance(items, list):
+                    _apply_wallets(items)
+                    return
+            except Exception:
+                pass
+        _next_slot = 7
+        _apply_wallets([dict(w) for w in DEFAULT_WALLETS])
+        save_wallet_config()
+
+
+def qr_svg(data: str) -> str:
+    if not data:
+        return ""
+    try:
+        import segno  # type: ignore
+        qr = segno.make(data, error="m")
+        buf = io.BytesIO()
+        qr.save(buf, kind="svg", scale=6, border=2)
+        svg = buf.getvalue().decode("utf-8", "replace")
+        pos = svg.find("<svg")
+        return svg[pos:] if pos >= 0 else svg
+    except Exception:
+        return ""
+
+
+def wallet_address(slot: str) -> str:
+    r = baw(slot, ["wallet", "address", "--json"], timeout=45)
+    if not r.get("success"):
+        return ""
+    for item in ((r.get("data") or {}).get("addresses") or []):
+        if str(item.get("binanceChainId")) == CHAIN:
+            return str(item.get("address") or "")
+    return ""
+
+
+def short_addr(a: str | None) -> str:
+    if not a:
+        return ""
+    return a[:6] + "…" + a[-4:]
+
+
+def to_decimal(v: Any, default: str = "0") -> Decimal:
+    try:
+        if v is None or v == "":
+            return Decimal(default)
+        return Decimal(str(v))
+    except Exception:
+        return Decimal(default)
+
+
+def json_get(url: str, timeout: int = 20) -> Any:
+    req = urllib.request.Request(url, headers={"User-Agent": "0xstudy-agentic/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8", "replace"))
+
+
+def rpc_call(method: str, params: list[Any], timeout: int = 8) -> Any:
+    payload = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
+    last: Any = None
+    for url in BSC_RPCS:
+        try:
+            req = urllib.request.Request(
+                url,
+                data=payload,
+                headers={"Content-Type": "application/json", "User-Agent": "0xstudy-agentic/1.0"},
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                j = json.loads(r.read().decode("utf-8", "replace"))
+            if "result" in j:
+                return j["result"]
+            last = j
+        except Exception as e:  # noqa: BLE001
+            last = repr(e)
+    raise RuntimeError(f"rpc failed: {last}")
+
+
+def baw(wallet: str, args: list[str], timeout: int = 70) -> dict[str, Any]:
+    if wallet not in WALLET_BY_ID and not (HOME / "aw" / wallet).is_dir():
+        return {"success": False, "error": "unknown wallet"}
+    env = os.environ.copy()
+    env["PATH"] = PATH
+    env["BINANCE_BAW_DIR"] = str(HOME / "aw" / wallet)
+    try:
+        p = subprocess.run(
+            [BAW, *args],
+            capture_output=True,
+            timeout=timeout,
+            env=env,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except subprocess.TimeoutExpired:
+        return {"success": False, "error": f"baw timeout after {timeout}s"}
+    except Exception as e:  # noqa: BLE001
+        return {"success": False, "error": repr(e)}
+    out = (p.stdout or "").strip()
+    err = (p.stderr or "").strip()
+    start = out.find("{")
+    if start < 0:
+        return {"success": False, "error": (err or out or f"baw rc={p.returncode}")[:700]}
+    try:
+        data = json.loads(out[start:])
+    except Exception:
+        return {"success": False, "error": (out[start:] or err)[:700]}
+    if not isinstance(data, dict):
+        return {"success": False, "error": "invalid baw response"}
+    if not data.get("success") and not data.get("error"):
+        data["error"] = err[:700] or "unknown baw error"
+    return data
+
+
+def err_text(result: dict[str, Any]) -> str:
+    e = result.get("error")
+    if isinstance(e, dict):
+        return str(e.get("message") or e.get("name") or json.dumps(e, ensure_ascii=False))[:700]
+    return str(e or "unknown error")[:700]
+
+
+def is_phone_confirm(result: dict[str, Any]) -> bool:
+    if result.get("success"):
+        return False
+    text = err_text(result)
+    return bool(RISK_CONFIRM_RE.search(text))
+
+
+def is_locked(result: dict[str, Any]) -> bool:
+    if result.get("success"):
+        return False
+    return bool(RISK_BLOCK_RE.search(err_text(result)))
+
+
+# ---------------------------------------------------------------- wallets / balances
+def wallet_balance(wallet: str) -> dict[str, Any]:
+    r = baw(wallet, ["wallet", "balance", "--binanceChainId", CHAIN, "--hideLowValue", "false", "--json"])
+    rows = r.get("data") if isinstance(r.get("data"), list) else []
+    return {
+        "ok": bool(r.get("success")),
+        "rows": rows,
+        "error": None if r.get("success") else err_text(r),
+        "updatedAt": now_iso(),
+    }
+
+
+def load_balance_cache() -> None:
+    global _balance_cache
+    try:
+        data = json.loads(BALANCE_PATH.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and isinstance(data.get("wallets"), dict):
+            data["ts"] = time.time() - 5
+            _balance_cache = data
+    except Exception:
+        pass
+
+
+def save_balance_cache(data: dict[str, Any]) -> None:
+    try:
+        tmp = BALANCE_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(BALANCE_PATH)
+    except Exception:
+        pass
+
+
+def load_market_cache() -> None:
+    global _market_cache
+    try:
+        data = json.loads(MARKET_PATH.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and isinstance(data.get("data"), dict):
+            _market_cache = data
+            _market_cache["ts"] = time.time() - 5
+    except Exception:
+        pass
+
+
+def save_market_cache(data: dict[str, Any]) -> None:
+    try:
+        tmp = MARKET_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(MARKET_PATH)
+    except Exception:
+        pass
+
+
+def refresh_balances(force: bool = False) -> dict[str, Any]:
+    global _balance_cache
+    with _cache_lock:
+        if not force and _balance_cache["wallets"] and time.time() - _balance_cache["ts"] < 3.2:
+            return _balance_cache
+    with _balance_refresh_lock:
+        with _cache_lock:
+            if not force and _balance_cache["wallets"] and time.time() - _balance_cache["ts"] < 3.2:
+                return _balance_cache
+            old = _balance_cache
+        # Network calls happen outside _cache_lock so the page can always read.
+        result: dict[str, Any] = {"ts": time.time(), "wallets": {}}
+        futures = { _baw_pool.submit(wallet_balance, w["id"]): w["id"] for w in WALLETS }
+        for f in as_completed(futures):
+            wid = futures[f]
+            try:
+                result["wallets"][wid] = f.result()
+            except Exception as e:  # noqa: BLE001
+                result["wallets"][wid] = {"ok": False, "rows": [], "error": repr(e), "updatedAt": now_iso()}
+        # If a wallet failed, preserve its last successful rows for a short grace window.
+        for wid, item in result["wallets"].items():
+            if not item["ok"] and old.get("wallets", {}).get(wid, {}).get("ok"):
+                previous = old["wallets"][wid]
+                if time.time() - old["ts"] < 20:
+                    result["wallets"][wid] = {**previous, "stale": True, "error": item.get("error")}
+        with _cache_lock:
+            _balance_cache = result
+        save_balance_cache(result)
+        return result
+
+
+def all_token_rows(balances: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    tokens: dict[str, dict[str, Any]] = {}
+    for w in WALLETS:
+        item = balances.get("wallets", {}).get(w["id"], {})
+        for row in item.get("rows", []) or []:
+            addr = str(row.get("address") or "").lower()
+            if not addr:
+                continue
+            qty = to_decimal(row.get("balance"))
+            if qty <= 0:
+                continue
+            rec = tokens.setdefault(addr, {
+                "address": addr,
+                "symbol": str(row.get("symbol") or addr[:6]),
+                "bawValue": Decimal(0),
+                "holders": [],
+            })
+            rec["holders"].append({"wallet": w["id"], "qty": qty, "value": to_decimal(row.get("value"))})
+            rec["bawValue"] += to_decimal(row.get("value"))
+    return tokens
+
+
+# ---------------------------------------------------------------- market data
+def dex_snapshot(addresses: list[str]) -> dict[str, dict[str, Any]]:
+    global _last_dex_error
+    addresses = [a.lower() for a in addresses if a]
+    if not addresses:
+        return {}
+    now = time.time()
+    with _cache_lock:
+        if _market_cache["data"] and now - _market_cache["ts"] < 4:
+            old = _market_cache["data"]
+            if all(a in old for a in addresses):
+                return old
+    out: dict[str, dict[str, Any]] = {}
+    for i in range(0, len(addresses), 25):
+        part = addresses[i:i + 25]
+        try:
+            payload = json_get(DEX_TOKENS + ",".join(part), timeout=18)
+        except Exception as e:  # noqa: BLE001
+            _last_dex_error = repr(e)[:200]
+            continue
+        by_base: dict[str, list[dict[str, Any]]] = {}
+        for pair in payload.get("pairs") or []:
+            if str(pair.get("chainId") or "").lower() != "bsc":
+                continue
+            base = str((pair.get("baseToken") or {}).get("address") or "").lower()
+            if base:
+                by_base.setdefault(base, []).append(pair)
+        for addr in part:
+            pairs = by_base.get(addr) or []
+            if not pairs:
+                continue
+            pairs.sort(key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0), reverse=True)
+            best = pairs[0]
+            liq = (best.get("liquidity") or {})
+            out[addr] = {
+                "price": float(best.get("priceUsd") or 0),
+                "liquidity": float(liq.get("usd") or 0),
+                "dex": str(best.get("dexId") or ""),
+                "labels": best.get("labels") or [],
+                "pair": str(best.get("pairAddress") or ""),
+                "quote": str((best.get("quoteToken") or {}).get("symbol") or ""),
+                "quoteAddress": str((best.get("quoteToken") or {}).get("address") or "").lower(),
+                "change24": float((best.get("priceChange") or {}).get("h24") or 0),
+                "url": str(best.get("url") or ""),
+                "pairCount": len(pairs),
+            }
+    with _cache_lock:
+        merged = dict(_market_cache["data"])
+        merged.update(out)
+        _market_cache["data"] = merged
+        _market_cache["ts"] = now
+        save_market_cache(_market_cache)
+        return merged
+
+
+def address_for_market(addr: str) -> str:
+    return WBNB if addr.lower() == NATIVE else addr.lower()
+
+
+def ensure_audit(addr: str, meta: dict[str, Any]) -> None:
+    addr = addr.lower()
+    if addr in (NATIVE, USDT, WBNB) or addr.startswith("0x8ac76a51"):
+        return
+    now = time.time()
+    with _cache_lock:
+        old = _audit_cache.get(addr)
+        if old and now - old.get("ts", 0) < 600 and not old.get("pending"):
+            return
+        if old and old.get("pending") and now - old.get("ts", 0) < 60:
+            return
+        _audit_cache[addr] = {"ts": now, "pending": True, "risk": "未审计", "hidden": False}
+    try:
+        payload = json_get(f"{HONEYPOT}?address={urllib.parse.quote(meta.get('address') or addr)}&chainID=56", timeout=22)
+        h = payload.get("honeypotResult") or {}
+        sim = payload.get("simulationResult") or {}
+        sell_tax = sim.get("sellTax")
+        buy_tax = sim.get("buyTax")
+        is_hp = bool(h.get("isHoneypot"))
+        risk = "貔貅" if is_hp else ("高税" if (sell_tax or 0) > 50 else "")
+        _audit_cache[addr] = {
+            "ts": now,
+            "pending": False,
+            "risk": risk,
+            "hidden": bool(is_hp or (sell_tax or 0) > 50),
+            "isHoneypot": is_hp,
+            "sellTax": sell_tax,
+            "buyTax": buy_tax,
+            "liquidity": (payload.get("pair") or {}).get("liquidity"),
+        }
+    except Exception as e:  # noqa: BLE001
+        _audit_cache[addr] = {
+            "ts": now,
+            "pending": False,
+            "risk": "未审计",
+            "hidden": False,
+            "error": repr(e)[:120],
+        }
+
+
+def ensure_audits(tokens: dict[str, dict[str, Any]], markets: dict[str, dict[str, Any]]) -> None:
+    for addr, rec in tokens.items():
+        m = markets.get(address_for_market(addr)) or {}
+        value = float(rec.get("bawValue") or 0)
+        if addr in (NATIVE, USDT, WBNB) or value >= 0.5 or (m.get("liquidity") or 0) >= 1000:
+            _audit_pool.submit(ensure_audit, addr, {"address": addr})
+
+
+def token_risk(addr: str, meta: dict[str, Any], value: float) -> dict[str, Any]:
+    addr = addr.lower()
+    if addr in (NATIVE, USDT) or addr.startswith("0x8ac76a51"):
+        return {"level": "safe", "label": "主流", "hidden": False}
+    m = meta
+    if not m or not m.get("price"):
+        return {"level": "danger", "label": "无池子", "hidden": True, "reason": "DEX 找不到可交易池"}
+    liq = float(m.get("liquidity") or 0)
+    if liq < 1000:
+        return {"level": "danger", "label": "低流动性", "hidden": True, "reason": f"池子流动性仅 ${liq:,.0f}"}
+    with _cache_lock:
+        a = _audit_cache.get(addr) or {}
+    if a.get("pending"):
+        return {"level": "warn", "label": "审计中", "hidden": value < 1, "reason": "正在检查卖出税/貔貅"}
+    if a.get("isHoneypot"):
+        return {"level": "danger", "label": "貔貅", "hidden": True, "reason": "模拟卖出失败 / 无法卖出"}
+    if (a.get("sellTax") or 0) > 50:
+        return {"level": "danger", "label": "高税", "hidden": True, "reason": f"卖出税 {a.get('sellTax')}%"}
+    if a.get("risk") == "未审计":
+        return {"level": "warn", "label": "未审计", "hidden": value < 1, "reason": "暂无貔貅审计结果"}
+    return {"level": "safe", "label": "正常", "hidden": value < 1, "reason": ""}
+
+
+# ---------------------------------------------------------------- portfolio
+def token_tax(addr: str) -> dict[str, Any]:
+    addr = addr.lower()
+    if addr in (NATIVE, USDT) or addr.startswith("0x8ac76a51"):
+        return {"buy": 0, "sell": 0}
+    with _cache_lock:
+        audit = _audit_cache.get(addr) or {}
+    return {"buy": audit.get("buyTax"), "sell": audit.get("sellTax")}
+
+
+def build_portfolio(wallet_filter: str = "all") -> dict[str, Any]:
+    # The background loop keeps this warm. Never make the UI wait for a full
+    # six-wallet CLI sweep; a stale snapshot is better than a four-second page.
+    balances = _balance_cache
+    if not balances.get("wallets"):
+        balances = refresh_balances(force=True)
+    tokens = all_token_rows(balances)
+    market_addrs = {address_for_market(a) for a in tokens}
+    market_addrs.add(WBNB)
+    markets = _market_cache.get("data") or {}
+    if not markets or any(a not in markets for a in market_addrs):
+        threading.Thread(target=dex_snapshot, args=(sorted(market_addrs),), daemon=True).start()
+        markets = _market_cache.get("data") or {}
+    elif time.time() - _market_cache.get("ts", 0) > 4:
+        # Stale-while-revalidate: the page never waits for DexScreener.
+        threading.Thread(target=dex_snapshot, args=(sorted(market_addrs),), daemon=True).start()
+    ensure_audits(tokens, markets)
+    wallets = []
+    for w in WALLETS:
+        item = balances.get("wallets", {}).get(w["id"], {})
+        rows = item.get("rows", []) or []
+        total = 0.0
+        visible = 0.0
+        for row in rows:
+            addr = str(row.get("address") or "").lower()
+            qty = float(to_decimal(row.get("balance")))
+            m = markets.get(address_for_market(addr)) or {}
+            price = float(m.get("price") or 0)
+            value = qty * price
+            risk = token_risk(addr, m, value)
+            total += value
+            if not risk.get("hidden"):
+                visible += value
+        ka = _keepalive.get("wallets", {}).get(w["id"], {})
+        wallets.append({
+            **w,
+            "status": "online" if item.get("ok") else "offline",
+            "error": item.get("error"),
+            "stale": bool(item.get("stale")),
+            "updatedAt": item.get("updatedAt"),
+            "balanceUsd": round(total, 2),
+            "visibleUsd": round(visible, 2),
+            "keepaliveAt": ka.get("at"),
+            "keepaliveStatus": ka.get("status"),
+        })
+
+    selected_ids = [w["id"] for w in WALLETS] if wallet_filter == "all" else ([wallet_filter] if wallet_filter in WALLET_BY_ID else [])
+    combined: dict[str, dict[str, Any]] = {}
+    for w in WALLETS:
+        if w["id"] not in selected_ids:
+            continue
+        item = balances.get("wallets", {}).get(w["id"], {})
+        for row in item.get("rows", []) or []:
+            addr = str(row.get("address") or "").lower()
+            qty = to_decimal(row.get("balance"))
+            if qty <= 0:
+                continue
+            rec = combined.setdefault(addr, {
+                "address": addr,
+                "symbol": str(row.get("symbol") or addr[:6]),
+                "holders": [],
+                "qty": Decimal(0),
+            })
+            rec["qty"] += qty
+            rec["holders"].append({"wallet": w["id"], "qty": str(qty)})
+
+    out_tokens = []
+    for addr, rec in combined.items():
+        m = markets.get(address_for_market(addr)) or {}
+        price = float(m.get("price") or 0)
+        qty = rec["qty"]
+        value = float(qty) * price
+        risk = token_risk(addr, m, value)
+        holders = []
+        for h in rec["holders"]:
+            hq = to_decimal(h["qty"])
+            holders.append({**h, "value": round(float(hq) * price, 6)})
+        holders.sort(key=lambda x: x["value"], reverse=True)
+        native = addr == NATIVE
+        out_tokens.append({
+            "address": addr,
+            "symbol": rec["symbol"],
+            "name": "BNB" if native else rec["symbol"],
+            "native": native,
+            "price": price,
+            "priceSource": "DEX" if m.get("price") else "N/A",
+            "change24": float(m.get("change24") or 0),
+            "liquidity": float(m.get("liquidity") or 0),
+            "dex": m.get("dex") or "",
+            "labels": m.get("labels") or [],
+            "pair": m.get("pair") or "",
+            "quote": m.get("quote") or "",
+            "pairCount": m.get("pairCount") or 0,
+            "qty": str(qty),
+            "value": round(value, 4),
+            "holders": holders,
+            "risk": risk,
+            "tax": token_tax(addr),
+            "hidden": bool(risk.get("hidden")),
+            "kline": "https://web3.okx.com/zh-hans/token/bsc/" + (WBNB if native else addr),
+            "marketAddress": address_for_market(addr),
+        })
+
+    out_tokens.sort(key=lambda t: (1 if t["hidden"] else 0, -t["value"]))
+    total = sum(t["value"] for t in out_tokens)
+    visible = sum(t["value"] for t in out_tokens if not t["hidden"])
+    hidden = [t for t in out_tokens if t["hidden"]]
+    return {
+        "wallets": wallets,
+        "tokens": out_tokens,
+        "selectedWallet": wallet_filter,
+        "totalUsd": round(total, 2),
+        "visibleUsd": round(visible, 2),
+        "hiddenUsd": round(total - visible, 2),
+        "hiddenCount": len(hidden),
+        "visibleCount": len(out_tokens) - len(hidden),
+        "updatedAt": now_iso(),
+        "balanceAge": round(time.time() - _balance_cache["ts"], 1),
+        "marketAge": round(time.time() - _market_cache["ts"], 1),
+        "keepalive": _keepalive,
+        "dexError": _last_dex_error,
+    }
+
+
+# ---------------------------------------------------------------- history
+def normalize_history(wallet: str, raw: dict[str, Any]) -> list[dict[str, Any]]:
+    txs = ((raw.get("data") or {}).get("transactions") or []) if raw.get("success") else []
+    out = []
+    for tx in txs:
+        hashes = tx.get("txHashList") or []
+        h = hashes[0] if hashes else {}
+        ins = (h.get("instructions") or {})
+        sends = ins.get("send") or []
+        receives = ins.get("receive") or []
+        send = sends[0] if sends else None
+        receive = receives[0] if receives else None
+        token = (send or receive or {}).get("tokenInfo") or {}
+        symbol = token.get("symbol") or ""
+        tx_type = tx.get("txType") or "contract"
+        if tx_type == "transfer":
+            kind = "发送" if send and not receive else "接收" if receive and not send else "交易"
+        elif tx_type == "contract_call":
+            kind = "交易" if send and receive else "合约"
+        else:
+            kind = "合约"
+        amount = ""
+        if send:
+            amount = f"{send.get('amount')} {((send.get('tokenInfo') or {}).get('symbol') or '')}".strip()
+        elif receive:
+            amount = f"{receive.get('amount')} {((receive.get('tokenInfo') or {}).get('symbol') or '')}".strip()
+        counterparty = ""
+        for candidate in (send, receive):
+            if not candidate:
+                continue
+            a = str((candidate.get("addressInfo") or {}).get("address") or "")
+            if a and a.lower() != WALLET_BY_ID[wallet]["address"].lower():
+                counterparty = short_addr(a)
+                break
+        fee = ((h.get("networkFee") or {}).get("feeValue"))
+        fee_bnb = 0.0
+        if fee:
+            try:
+                fee_bnb = float(Decimal(str(fee)) / Decimal(10 ** int((h.get("networkFee") or {}).get("feeTokenDecimals") or 18)))
+            except Exception:
+                fee_bnb = 0.0
+        out.append({
+            "wallet": wallet,
+            "walletLabel": WALLET_BY_ID[wallet]["label"],
+            "time": tx.get("txTime"),
+            "kind": kind,
+            "txType": tx_type,
+            "symbol": symbol,
+            "amount": amount,
+            "counterparty": counterparty,
+            "status": tx.get("status") or h.get("status") or "unknown",
+            "txHash": tx.get("txHash") or h.get("txHash") or "",
+            "feeBnb": round(fee_bnb, 8),
+        })
+    return out
+
+
+def _history_disk_path(wallet: str) -> Path:
+    return HISTORY_DIR / (re.sub(r"[^a-zA-Z0-9_-]", "_", wallet) + ".json")
+
+
+def _read_history_disk(wallet: str) -> list[dict[str, Any]]:
+    try:
+        data = json.loads(_history_disk_path(wallet).read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _refresh_history(wallet: str) -> None:
+    with _history_refresh_lock:
+        if wallet in _history_refreshing:
+            return
+        _history_refreshing.add(wallet)
+    try:
+        r = baw(wallet, ["wallet", "tx-history", "--binanceChainId", CHAIN, "--size", "50", "--json"])
+        if not r.get("success"):
+            return
+        items = normalize_history(wallet, r)
+        with _cache_lock:
+            _history_cache[wallet] = (time.time(), items)
+        try:
+            tmp = _history_disk_path(wallet).with_suffix(".tmp")
+            tmp.write_text(json.dumps(items, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(_history_disk_path(wallet))
+        except Exception:
+            pass
+    finally:
+        with _history_refresh_lock:
+            _history_refreshing.discard(wallet)
+
+
+def history_for(wallet: str, force: bool = False) -> list[dict[str, Any]]:
+    now = time.time()
+    with _cache_lock:
+        cached = _history_cache.get(wallet)
+        if not force and cached and now - cached[0] < 60:
+            return cached[1]
+        if cached:
+            old_items = cached[1]
+        else:
+            disk = _read_history_disk(wallet)
+            if disk:
+                _history_cache[wallet] = (0.0, disk)
+            old_items = disk
+    if old_items:
+        # Stale-while-revalidate: paint instantly, refresh in the background.
+        threading.Thread(target=_refresh_history, args=(wallet,), daemon=True).start()
+        return old_items
+    # First ever request for this wallet: must fetch synchronously once.
+    _refresh_history(wallet)
+    with _cache_lock:
+        return (_history_cache.get(wallet) or (0, []))[1]
+
+
+def build_history(wallet_filter: str = "all", limit: int = 80) -> dict[str, Any]:
+    if wallet_filter == "all":
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            lists = list(ex.map(history_for, [w["id"] for w in WALLETS]))
+        items = [x for sub in lists for x in sub]
+    else:
+        items = history_for(wallet_filter) if wallet_filter in WALLET_BY_ID else []
+    items.sort(key=lambda x: x.get("time") or "", reverse=True)
+    return {"items": items[:limit], "selectedWallet": wallet_filter, "updatedAt": now_iso()}
+
+
+# ---------------------------------------------------------------- quote / trade
+def target_for(token: str) -> str:
+    t = token.lower()
+    if t == USDT:
+        return NATIVE
+    return USDT
+
+
+def token_market(token: str) -> dict[str, Any]:
+    addr = address_for_market(token)
+    markets = dex_snapshot([addr])
+    return markets.get(addr) or {}
+
+
+def quote_for(wallet: str, token: str, qty: str, slippage: str | float = "auto") -> dict[str, Any]:
+    token = token.lower()
+    target = target_for(token)
+    r = baw(wallet, [
+        "market-order", "quote", "--binanceChainId", CHAIN,
+        "--fromToken", token, "--toToken", target,
+        "--fromTokenQty", qty, "--slippage", str(slippage), "--json",
+    ], timeout=35)
+    if not r.get("success"):
+        return {
+            "ok": False,
+            "error": err_text(r),
+            "needsPhoneConfirm": is_phone_confirm(r),
+            "wallet": wallet,
+        }
+    data = r.get("data") or {}
+    to_amount = to_decimal(data.get("toCoinAmount"))
+    from_amount = to_decimal(data.get("fromCoinAmount") or qty)
+    m = token_market(token)
+    token_price = float(m.get("price") or 0)
+    target_price = 1.0 if target == USDT else float(token_market(NATIVE).get("price") or 0)
+    expected_usd = float(from_amount) * token_price
+    actual_usd = float(to_amount) * target_price
+    deviation = ((actual_usd - expected_usd) / expected_usd * 100) if expected_usd > 0 else 0.0
+    guard = "ok"
+    if expected_usd > 0 and deviation < -8:
+        guard = "blocked"
+    elif expected_usd > 0 and deviation < -3:
+        guard = "warn"
+    return {
+        "ok": True,
+        "wallet": wallet,
+        "token": token,
+        "target": target,
+        "fromSymbol": data.get("fromCoinSymbol"),
+        "toSymbol": data.get("toCoinSymbol"),
+        "fromAmount": str(from_amount),
+        "toAmount": str(to_amount),
+        "slippagePct": round(float(data.get("slippage") or 0) * 100, 3),
+        "impliedPrice": float(to_amount) / float(from_amount) if float(from_amount) else 0,
+        "marketPrice": token_price,
+        "actualUsd": round(actual_usd, 4),
+        "expectedUsd": round(expected_usd, 4),
+        "deviationPct": round(deviation, 3),
+        "guard": guard,
+        "tax": token_tax(token),
+        "pool": {
+            "dex": m.get("dex"),
+            "labels": m.get("labels"),
+            "pair": m.get("pair"),
+            "liquidity": m.get("liquidity"),
+            "quote": m.get("quote"),
+            "pairCount": m.get("pairCount"),
+        },
+        "raw": data,
+    }
+
+
+def wallet_token_qty(wallet: str, token: str) -> tuple[Decimal, str | None]:
+    token = token.lower()
+    balances = _balance_cache
+    if not balances.get("wallets"):
+        balances = refresh_balances(force=True)
+    item = balances.get("wallets", {}).get(wallet, {})
+    for row in item.get("rows", []) or []:
+        if str(row.get("address") or "").lower() == token:
+            return to_decimal(row.get("balance")), None
+    return Decimal(0), "余额为 0"
+
+
+def qty_for_pct(wallet: str, token: str, pct: float) -> tuple[Decimal, str | None]:
+    qty, err = wallet_token_qty(wallet, token)
+    if err:
+        return Decimal(0), err
+    amount = qty * Decimal(str(pct)) / Decimal(100)
+    if pct >= 99.999 and token == NATIVE:
+        amount -= Decimal("0.0005")
+    if amount <= 0:
+        return Decimal(0), "数量过小"
+    return amount, None
+
+
+def fmt_qty(d: Decimal, token: str) -> str:
+    if token == NATIVE:
+        s = format(d.quantize(Decimal("0.000000000000000001"), rounding=ROUND_DOWN), "f")
+    else:
+        s = format(d, "f").rstrip("0").rstrip(".") or "0"
+    return s
+
+
+def new_task(kind: str, legs: list[dict[str, Any]], idem: str | None) -> dict[str, Any]:
+    with _task_lock:
+        if idem:
+            for t in _tasks.values():
+                if t.get("idempotencyKey") == idem and time.time() - float(t.get("createdTs", 0)) < 60:
+                    return t
+        task_id = f"t{int(time.time() * 1000)}{os.urandom(2).hex()}"
+        task = {
+            "id": task_id,
+            "kind": kind,
+            "status": "queued",
+            "createdAt": now_iso(),
+            "createdTs": time.time(),
+            "legs": legs,
+            "idempotencyKey": idem,
+        }
+        _tasks[task_id] = task
+    return task
+
+
+def invalidate_history(wallet: str) -> None:
+    with _cache_lock:
+        _history_cache.pop(wallet, None)
+    threading.Thread(target=_refresh_history, args=(wallet,), daemon=True).start()
+
+
+def add_audit(entry: dict[str, Any]) -> None:
+    try:
+        with open(DATA / "audit.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps({"at": now_iso(), **entry}, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def run_sell_task(task: dict[str, Any], token: str, pct: float, slippage: float, amount: str | None = None) -> None:
+    token = token.lower()
+    target = target_for(token)
+    task["status"] = "running"
+    try:
+        with ThreadPoolExecutor(max_workers=min(3, len(task["legs"]))) as ex:
+            futures = {}
+            for leg in task["legs"]:
+                futures[ex.submit(sell_leg, leg, token, target, pct, slippage)] = leg
+            for f in as_completed(futures):
+                leg = futures[f]
+                try:
+                    f.result()
+                except Exception as e:  # noqa: BLE001
+                    leg["status"] = "failed"
+                    leg["error"] = repr(e)
+        statuses = {l.get("status") for l in task["legs"]}
+        if "needs_confirm" in statuses:
+            task["status"] = "needs_confirm"
+        elif statuses <= {"submitted"}:
+            task["status"] = "submitted"
+        elif "submitted" in statuses:
+            task["status"] = "partial"
+        else:
+            task["status"] = "failed"
+        task["finishedAt"] = now_iso()
+        for leg in task["legs"]:
+            invalidate_history(leg["wallet"])
+        add_audit({"task": task["id"], "kind": "sell", "token": token, "pct": pct, "amount": amount, "legs": task["legs"]})
+    except Exception:  # noqa: BLE001
+        task["status"] = "failed"
+        task["error"] = traceback.format_exc()[-800:]
+        task["finishedAt"] = now_iso()
+
+
+def sell_leg(leg: dict[str, Any], token: str, target: str, pct: float, slippage: float) -> None:
+    wid = leg["wallet"]
+    leg["status"] = "checking"
+    if not WALLET_BY_ID[wid].get("trade"):
+        leg.update(status="failed", error="该钱包交易权限已关闭")
+        return
+    with _wallet_locks[wid]:
+        if leg.get("fixedQty"):
+            try:
+                qty = Decimal(str(leg["fixedQty"]))
+            except Exception:
+                leg.update(status="failed", error="invalid amount")
+                return
+            if qty <= 0:
+                leg.update(status="failed", error="amount must be positive")
+                return
+        else:
+            qty, err = qty_for_pct(wid, token, pct)
+            if err:
+                leg.update(status="failed", error=err)
+                return
+        q = fmt_qty(qty, token)
+        leg["qty"] = q
+        lock = baw(wid, ["wallet", "tx-lock", "--binanceChainId", CHAIN, "--json"], timeout=30)
+        if lock.get("success") and str((lock.get("data") or {}).get("status") or "").upper() == "LOCKED":
+            leg.update(status="failed", error="交易锁已开启，请先在币安 App 解锁")
+            return
+        leg["status"] = "quoting"
+        pre = quote_for(wid, token, q, slippage)
+        if not pre.get("ok"):
+            leg.update(status="needs_confirm" if pre.get("needsPhoneConfirm") else "failed",
+                       error=pre.get("error"))
+            return
+        leg["quote"] = {k: pre.get(k) for k in ("toAmount", "toSymbol", "deviationPct", "guard", "slippagePct", "pool")}
+        if pre.get("guard") == "blocked":
+            leg.update(status="failed", error=f"报价偏离最优池 {pre.get('deviationPct')}% ，已拦截（保护）")
+            return
+        leg["status"] = "submitting"
+        r = baw(wid, [
+            "market-order", "swap", "--binanceChainId", CHAIN,
+            "--fromToken", token, "--toToken", target,
+            "--fromTokenQty", q, "--slippage", str(slippage),
+            "--mev", "true", "--gasLevel", "HIGH", "--json",
+        ], timeout=85)
+        if not r.get("success"):
+            if is_phone_confirm(r):
+                leg.update(status="needs_confirm", error=err_text(r))
+            else:
+                leg.update(status="failed", error=err_text(r))
+            return
+        data = r.get("data") or {}
+        leg.update(
+            status="submitted",
+            orderId=data.get("orderId") or data.get("id"),
+            txHash=data.get("txHash"),
+            result=data if isinstance(data, dict) else {},
+        )
+
+
+def run_send_task(task: dict[str, Any], token: str, pct: float, recipient: str, amount: str | None = None) -> None:
+    token = token.lower()
+    task["status"] = "running"
+    try:
+        with ThreadPoolExecutor(max_workers=min(3, len(task["legs"]))) as ex:
+            futures = [ex.submit(send_leg, leg, token, pct, recipient, amount) for leg in task["legs"]]
+            for f in as_completed(futures):
+                try:
+                    f.result()
+                except Exception as e:  # noqa: BLE001
+                    pass
+        statuses = {l.get("status") for l in task["legs"]}
+        if "needs_confirm" in statuses:
+            task["status"] = "needs_confirm"
+        elif statuses <= {"submitted"}:
+            task["status"] = "submitted"
+        elif "submitted" in statuses:
+            task["status"] = "partial"
+        else:
+            task["status"] = "failed"
+        task["finishedAt"] = now_iso()
+        for leg in task["legs"]:
+            invalidate_history(leg["wallet"])
+        add_audit({"task": task["id"], "kind": "send", "token": token, "pct": pct, "amount": amount, "to": recipient, "legs": task["legs"]})
+    except Exception:  # noqa: BLE001
+        task["status"] = "failed"
+        task["error"] = traceback.format_exc()[-800:]
+        task["finishedAt"] = now_iso()
+
+
+def send_leg(leg: dict[str, Any], token: str, pct: float, recipient: str, amount: str | None = None) -> None:
+    wid = leg["wallet"]
+    leg["status"] = "checking"
+    with _wallet_locks[wid]:
+        if amount is not None:
+            try:
+                qty = Decimal(str(amount))
+            except Exception:
+                leg.update(status="failed", error="invalid amount")
+                return
+            if qty <= 0:
+                leg.update(status="failed", error="amount must be positive")
+                return
+        else:
+            qty, err = qty_for_pct(wid, token, pct)
+            if err:
+                leg.update(status="failed", error=err)
+                return
+        q = fmt_qty(qty, token)
+        leg["qty"] = q
+        leg["status"] = "submitting"
+        r = baw(wid, [
+            "wallet", "send", "--binanceChainId", CHAIN,
+            "--amount", q, "--tokenAddress", token,
+            "--recipient", recipient, "--gasLevel", "HIGH", "--json",
+        ], timeout=85)
+        if not r.get("success"):
+            if is_phone_confirm(r):
+                leg.update(status="needs_confirm", error=err_text(r))
+            else:
+                leg.update(status="failed", error=err_text(r))
+            return
+        data = r.get("data") or {}
+        leg.update(status="submitted", txHash=data.get("txHash"), result=data if isinstance(data, dict) else {})
+
+
+def start_sell(payload: dict[str, Any]) -> dict[str, Any]:
+    token = str(payload.get("token") or "").lower()
+    wallet_ids = [str(x) for x in (payload.get("walletIds") or []) if str(x) in WALLET_BY_ID]
+    amount_raw = payload.get("amount")
+    amount: str | None = None
+    if amount_raw not in (None, ""):
+        try:
+            amount_dec = Decimal(str(amount_raw))
+        except Exception as exc:
+            raise ValueError("invalid amount") from exc
+        if amount_dec <= 0:
+            raise ValueError("invalid amount")
+        amount = str(amount_raw)
+    pct = float(payload.get("pct") or 0)
+    slippage = float(payload.get("slippage") or 1)
+    if not token or not wallet_ids:
+        raise ValueError("token and walletIds required")
+    if amount is None and not (0 < pct <= 100):
+        raise ValueError("invalid pct")
+    if not (0.05 <= slippage <= 50):
+        raise ValueError("invalid slippage")
+    idem = str(payload.get("idempotencyKey") or "") or None
+    if amount is not None:
+        balances: list[tuple[str, Decimal]] = []
+        total_qty = Decimal(0)
+        for w in wallet_ids:
+            qty, err = wallet_token_qty(w, token)
+            if err or qty <= 0:
+                continue
+            balances.append((w, qty))
+            total_qty += qty
+        if total_qty <= 0:
+            raise ValueError("no token balance")
+        if Decimal(amount) > total_qty:
+            raise ValueError("amount exceeds selected wallet balance")
+        legs = []
+        remaining = Decimal(amount)
+        for idx, (w, qty) in enumerate(balances):
+            share = remaining if idx == len(balances) - 1 else (Decimal(amount) * qty / total_qty)
+            share = min(share, qty)
+            if share > 0:
+                legs.append({"wallet": w, "status": "queued", "fixedQty": str(share)})
+            remaining -= share
+        if not legs:
+            raise ValueError("no sellable amount")
+    else:
+        legs = [{"wallet": w, "status": "queued"} for w in wallet_ids]
+    task = new_task("sell", legs, idem)
+    if task.get("status") != "queued" or task.get("started"):
+        return task
+    task["started"] = True
+    threading.Thread(target=run_sell_task, args=(task, token, pct, slippage, amount), daemon=True).start()
+    return task
+
+
+def start_send(payload: dict[str, Any]) -> dict[str, Any]:
+    token = str(payload.get("token") or "").lower()
+    wallet_ids = [str(x) for x in (payload.get("walletIds") or []) if str(x) in WALLET_BY_ID]
+    amount_raw = payload.get("amount")
+    amount: str | None = None
+    if amount_raw not in (None, ""):
+        try:
+            amount_dec = Decimal(str(amount_raw))
+        except Exception as exc:
+            raise ValueError("invalid amount") from exc
+        if amount_dec <= 0:
+            raise ValueError("invalid amount")
+        amount = str(amount_raw)
+    pct = float(payload.get("pct") or 100)
+    recipient = str(payload.get("recipient") or "").strip()
+    if not token or not wallet_ids or not re.fullmatch(r"0x[a-fA-F0-9]{40}", recipient):
+        raise ValueError("invalid token/wallet/recipient")
+    if amount is None and not (0 < pct <= 100):
+        raise ValueError("invalid pct")
+    idem = str(payload.get("idempotencyKey") or "") or None
+    legs = [{"wallet": w, "status": "queued"} for w in wallet_ids]
+    task = new_task("send", legs, idem)
+    if task.get("status") != "queued" or task.get("started"):
+        return task
+    task["started"] = True
+    threading.Thread(target=run_send_task, args=(task, token, pct, recipient, amount), daemon=True).start()
+    return task
+
+
+# ---------------------------------------------------------------- wallet add / remove
+def start_wallet_add(payload: dict[str, Any]) -> dict[str, Any]:
+    global _next_slot
+    label = str(payload.get("label") or "").strip()[:30]
+    with _config_lock:
+        slot = f"w{_next_slot}"
+        _next_slot += 1
+        save_wallet_config()
+    wdir = HOME / "aw" / slot
+    wdir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        os.chmod(wdir, 0o700)
+    except Exception:
+        pass
+    r = baw(slot, ["auth", "signin", "--json"], timeout=70)
+    if not r.get("success"):
+        return {"ok": False, "error": err_text(r)}
+    data = r.get("data") or {}
+    url = str(data.get("urlForWeb") or "")
+    qr_id = str(data.get("qrCodeId") or "")
+    if not url or not qr_id:
+        return {"ok": False, "error": "BAW 没有返回二维码"}
+    expire_at = int(data.get("expireAt") or 0)
+    expires_in = max(0, int(expire_at / 1000 - time.time())) if expire_at > 10_000_000_000 else 300
+    pending = {
+        "slot": slot,
+        "label": label or f"钱包 {slot}",
+        "url": url,
+        "qrCodeId": qr_id,
+        "pairingCode": str(data.get("pairingCode") or ""),
+        "expireAt": expire_at,
+        "status": "waiting",
+        "error": None,
+        "wallet": None,
+        "at": now_iso(),
+    }
+    _pending_wallets[slot] = pending
+    threading.Thread(target=_verify_wallet, args=(slot, qr_id), daemon=True).start()
+    return {
+        "ok": True,
+        "slot": slot,
+        "url": url,
+        "qrSvg": qr_svg(url),
+        "pairingCode": pending["pairingCode"],
+        "expiresIn": expires_in,
+    }
+
+
+def _verify_wallet(slot: str, qr_id: str) -> None:
+    pending = _pending_wallets.get(slot)
+    if not pending:
+        return
+    r = baw(slot, ["auth", "verify", "--qrCodeId", qr_id, "--json"], timeout=620)
+    if not r.get("success"):
+        pending["status"] = "expired"
+        pending["error"] = err_text(r)
+        return
+    addr = wallet_address(slot)
+    if not addr:
+        pending["status"] = "failed"
+        pending["error"] = "二维码已确认，但读取 BSC 地址失败"
+        return
+    label = pending.get("label") or f"钱包 {slot}"
+    with _config_lock:
+        # A duplicate slot cannot happen, but keep the config clean.
+        WALLETS[:] = [w for w in WALLETS if w["id"] != slot]
+        _apply_wallets(WALLETS + [{
+            "id": slot,
+            "label": label,
+            "agent": label,
+            "address": addr,
+            "color": COLORS[len(WALLETS) % len(COLORS)],
+            "trade": True,
+        }])
+        save_wallet_config()
+    pending["status"] = "added"
+    pending["wallet"] = dict(WALLET_BY_ID.get(slot) or {})
+    pending["error"] = None
+    _keepalive.setdefault("wallets", {})[slot] = {"at": now_iso(), "status": "CONNECTED", "error": None}
+    _keepalive["at"] = now_iso()
+    try:
+        refresh_balances(force=True)
+    except Exception:
+        pass
+    threading.Thread(target=lambda: history_for(slot), daemon=True).start()
+
+
+def pending_wallet(slot: str) -> dict[str, Any]:
+    p = _pending_wallets.get(slot)
+    if not p:
+        return {"status": "missing"}
+    return {k: v for k, v in p.items() if k != "qrCodeId"}
+
+
+def rename_wallet(wallet_id: str, label: str) -> dict[str, Any]:
+    clean = str(label or "").strip()[:30]
+    if not clean:
+        raise ValueError("label required")
+    with _config_lock:
+        w = WALLET_BY_ID.get(wallet_id)
+        if not w:
+            return {"ok": False, "error": "wallet not found"}
+        w["label"] = clean
+        save_wallet_config()
+    return {"ok": True, "wallet": dict(w)}
+
+
+def remove_wallet(wallet_id: str) -> dict[str, Any]:
+    if wallet_id not in WALLET_BY_ID:
+        return {"ok": False, "error": "wallet not found"}
+    with _config_lock:
+        _apply_wallets([w for w in WALLETS if w["id"] != wallet_id])
+        save_wallet_config()
+    _keepalive.get("wallets", {}).pop(wallet_id, None)
+    _history_cache.pop(wallet_id, None)
+    _balance_cache["ts"] = 0
+    try:
+        refresh_balances(force=True)
+    except Exception:
+        pass
+    return {"ok": True, "removed": wallet_id}
+
+
+# ---------------------------------------------------------------- keepalive
+def load_keepalive() -> None:
+    global _keepalive
+    try:
+        _keepalive = json.loads((DATA / "keepalive.json").read_text(encoding="utf-8"))
+    except Exception:
+        _keepalive = {"wallets": {}, "at": None}
+
+
+def save_keepalive() -> None:
+    try:
+        tmp = DATA / "keepalive.json.tmp"
+        tmp.write_text(json.dumps(_keepalive, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(DATA / "keepalive.json")
+    except Exception:
+        pass
+
+
+def keepalive_once() -> None:
+    global _keepalive
+    out = {}
+    for w in WALLETS:
+        r = baw(w["id"], ["wallet", "status", "--json"], timeout=30)
+        st = str(((r.get("data") or {}).get("status") or ("CONNECTED" if r.get("success") else "UNKNOWN"))).upper()
+        out[w["id"]] = {"at": now_iso(), "status": st, "error": None if r.get("success") else err_text(r)}
+    with _cache_lock:
+        _keepalive = {"wallets": out, "at": now_iso()}
+    save_keepalive()
+
+
+def keepalive_loop() -> None:
+    time.sleep(8)
+    while True:
+        try:
+            keepalive_once()
+        except Exception:
+            pass
+        time.sleep(3600)
+
+
+def data_loop() -> None:
+    """Keep BAW balances and DEX prices warm so /api/portfolio is instant."""
+    time.sleep(1)
+    while True:
+        try:
+            refresh_balances(force=True)
+            tokens = all_token_rows(_balance_cache)
+            addrs = {address_for_market(a) for a in tokens}
+            addrs.add(WBNB)
+            dex_snapshot(sorted(addrs))
+        except Exception:
+            pass
+        time.sleep(2.5)
+
+
+def history_loop() -> None:
+    """Prefetch every wallet's records so the History tab never waits."""
+    time.sleep(4)
+    while True:
+        try:
+            for wallet in list(WALLETS):
+                history_for(wallet["id"])
+                time.sleep(0.15)
+        except Exception:
+            pass
+        time.sleep(45)
+
+
+# ---------------------------------------------------------------- HTTP
+class Handler(BaseHTTPRequestHandler):
+    server_version = "0xStudyAgentic/1.0"
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        # Keep journald small; no request body, cookie, or token.
+        print("%s - %s" % (self.address_string(), fmt % args))
+
+    def _json(self, data: Any, status: int = 200) -> None:
+        body = json.dumps(data, ensure_ascii=False, default=str).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _file(self, path: Path) -> None:
+        if not path.is_file():
+            self.send_error(404)
+            return
+        body = path.read_bytes()
+        ct = {".html": "text/html; charset=utf-8", ".js": "application/javascript; charset=utf-8",
+              ".css": "text/css; charset=utf-8", ".png": "image/png", ".svg": "image/svg+xml"}.get(path.suffix, "application/octet-stream")
+        self.send_response(200)
+        self.send_header("Content-Type", ct)
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "SAMEORIGIN")
+        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'self'")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _svg(self, body: str, status: int = 200) -> None:
+        raw = body.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "image/svg+xml; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def _payload(self) -> dict[str, Any]:
+        n = int(self.headers.get("Content-Length") or 0)
+        if n > 1_000_000:
+            raise ValueError("body too large")
+        raw = self.rfile.read(n) if n else b"{}"
+        data = json.loads(raw.decode("utf-8", "replace") or "{}")
+        if not isinstance(data, dict):
+            raise ValueError("object required")
+        if self.headers.get("X-Requested-With") != "agentic":
+            raise PermissionError("missing request header")
+        return data
+
+    def do_GET(self) -> None:  # noqa: N802
+        try:
+            parsed = urllib.parse.urlparse(self.path)
+            path = parsed.path
+            qs = urllib.parse.parse_qs(parsed.query)
+            if path in ("/", "/index.html"):
+                return self._file(ROOT / "static" / "index.html")
+            if path == "/app.js":
+                return self._file(ROOT / "static" / "app.js")
+            if path == "/styles.css":
+                return self._file(ROOT / "static" / "styles.css")
+            if path.startswith("/assets/"):
+                name = path[len("/assets/"):]
+                if re.fullmatch(r"[A-Za-z0-9_-]+\.(png|svg|jpg|jpeg)", name):
+                    return self._file(ROOT / "static" / "assets" / name)
+                return self._json({"error": "not found"}, 404)
+            if path == "/api/qr":
+                text = (qs.get("text") or [""])[0].strip()
+                if not re.fullmatch(r"0x[a-fA-F0-9]{40}", text):
+                    return self._json({"error": "invalid address"}, 400)
+                svg = qr_svg(text)
+                if not svg:
+                    return self._json({"error": "qr unavailable"}, 500)
+                return self._svg(svg)
+            if path == "/api/portfolio":
+                wallet = (qs.get("wallet") or ["all"])[0]
+                return self._json(build_portfolio(wallet))
+            if path == "/api/wallets":
+                return self._json({"wallets": WALLETS, "nextSlot": _next_slot})
+            if path == "/api/wallets/pending":
+                slot = (qs.get("slot") or [""])[0]
+                return self._json(pending_wallet(slot))
+            if path == "/api/history":
+                wallet = (qs.get("wallet") or ["w1"])[0]
+                limit = int((qs.get("limit") or ["80"])[0])
+                return self._json(build_history(wallet, min(limit, 300)))
+            if path == "/api/keepalive":
+                return self._json({"keepalive": _keepalive, "wallets": [w["id"] for w in WALLETS]})
+            if path == "/api/health":
+                return self._json({"ok": True, "service": "agentic-wallet", "updatedAt": now_iso(),
+                                   "balanceAge": round(time.time() - _balance_cache["ts"], 1),
+                                   "keepalive": _keepalive})
+            if path.startswith("/api/task/"):
+                tid = path.rsplit("/", 1)[-1]
+                with _task_lock:
+                    task = _tasks.get(tid)
+                if not task:
+                    return self._json({"error": "task not found"}, 404)
+                return self._json(task)
+            return self._json({"error": "not found"}, 404)
+        except Exception as e:  # noqa: BLE001
+            return self._json({"error": str(e)}, 500)
+
+    def do_POST(self) -> None:  # noqa: N802
+        try:
+            parsed = urllib.parse.urlparse(self.path)
+            path = parsed.path
+            payload = self._payload()
+            if path == "/api/wallets/start":
+                return self._json(start_wallet_add(payload))
+            if path.startswith("/api/wallets/") and path.endswith("/rename"):
+                wallet_id = path[len("/api/wallets/"):-len("/rename")].strip("/")
+                return self._json(rename_wallet(wallet_id, str(payload.get("label") or "")))
+            if path == "/api/quote":
+                wallet = str(payload.get("wallet") or "w1")
+                token = str(payload.get("token") or "").lower()
+                pct = float(payload.get("pct") or 50)
+                if wallet not in WALLET_BY_ID or not token:
+                    raise ValueError("invalid wallet/token")
+                if payload.get("qty") not in (None, ""):
+                    try:
+                        qty = Decimal(str(payload.get("qty")))
+                    except Exception as exc:
+                        raise ValueError("invalid qty") from exc
+                    if qty <= 0:
+                        raise ValueError("invalid qty")
+                else:
+                    qty, err = qty_for_pct(wallet, token, pct)
+                    if err:
+                        return self._json({"ok": False, "error": err})
+                q = fmt_qty(qty, token)
+                return self._json(quote_for(wallet, token, q, payload.get("slippage") or "auto"))
+            if path == "/api/sell":
+                task = start_sell(payload)
+                return self._json(task, 202)
+            if path == "/api/send":
+                task = start_send(payload)
+                return self._json(task, 202)
+            return self._json({"error": "not found"}, 404)
+        except PermissionError as e:
+            return self._json({"error": str(e)}, 403)
+        except ValueError as e:
+            return self._json({"error": str(e)}, 400)
+        except Exception as e:  # noqa: BLE001
+            traceback.print_exc()
+            return self._json({"error": str(e)}, 500)
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        try:
+            if self.headers.get("X-Requested-With") != "agentic":
+                return self._json({"error": "missing request header"}, 403)
+            path = urllib.parse.urlparse(self.path).path
+            if path.startswith("/api/wallets/"):
+                wallet_id = path.rsplit("/", 1)[-1]
+                result = remove_wallet(wallet_id)
+                return self._json(result, 200 if result.get("ok") else 404)
+            return self._json({"error": "not found"}, 404)
+        except Exception as e:  # noqa: BLE001
+            return self._json({"error": str(e)}, 500)
+
+
+def main() -> None:
+    load_wallet_config()
+    load_balance_cache()
+    load_market_cache()
+    load_keepalive()
+    # Warm caches in the background; first page request does not wait for audits.
+    threading.Thread(target=data_loop, daemon=True).start()
+    threading.Thread(target=history_loop, daemon=True).start()
+    threading.Thread(target=keepalive_loop, daemon=True).start()
+    print(f"agentic-wallet listening on 127.0.0.1:{PORT}")
+    ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+
+
+if __name__ == "__main__":
+    main()
