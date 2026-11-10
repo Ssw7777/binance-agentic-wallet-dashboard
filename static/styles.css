@@ -1216,3 +1216,315 @@ body{font-size:18px}
 @media (max-width:1400px){.app{padding:18px 24px 22px}}
 @media (max-width:1350px){.content-grid{grid-template-columns:1fr}}
 @media (max-width:900px){.app{padding:14px}}
+/* ============================================================
+   Mobile / phone landscape pass
+   Desktop (>1100px) is intentionally left untouched.
+   ============================================================ */
+
+/* Tablet / large-phone landscape: keep the desktop chrome but use asset cards
+   instead of forcing seven columns into a narrow table. */
+@media (min-width: 901px) and (max-width: 1100px) {
+  .asset-head { display: none; }
+  .asset-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      "asset value"
+      "price balance"
+      "liq tax"
+      "actions actions";
+    gap: 6px 12px;
+    min-height: 0;
+    padding: 12px 16px;
+    align-items: start;
+  }
+  .cell-asset { grid-area: asset; }
+  .value { grid-area: value; text-align: right; }
+  .price { grid-area: price; display: flex; }
+  .balance { grid-area: balance; display: flex; align-items: flex-end; text-align: right; }
+  .liq { grid-area: liq; display: flex; }
+  .tax-cell { grid-area: tax; display: flex; align-items: flex-end; text-align: right; }
+  .actions { grid-area: actions; justify-content: flex-start; padding-top: 7px; border-top: 1px solid var(--line-2); }
+  .sell-group { display: flex; }
+  .mobile-pcts { display: none; }
+  .sell-body, .send-body { grid-template-columns: 1fr 1fr; }
+}
+
+@media (max-width: 900px) {
+  html { -webkit-text-size-adjust: 100%; }
+  body { font-size: 16px; }
+  .app { padding: 12px 12px 18px; }
+
+  /* header */
+  .hero { flex-direction: column; align-items: stretch; gap: 9px; margin-bottom: 10px; }
+  .hero-copy { padding-top: 0; }
+  .hero-copy h1 { font-size: 25px; line-height: 1.16; letter-spacing: -.03em; }
+  .hero-actions { width: 100%; display: flex; flex-wrap: wrap; gap: 6px; }
+  .view-switch { order: 0; width: 100%; display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px; }
+  .view-switch button { height: 36px; padding: 0 6px; font-size: 14px; }
+  .keepalive-entry { order: 2; height: 34px; font-size: 12px; }
+  .hero-actions > .icon-btn { order: 1; width: 34px; height: 34px; }
+  .hero-actions > .btn { order: 3; }
+
+  /* overview: full width on phone, no forced half-width */
+  .overview { width: 100%; min-width: 0; max-width: none; flex-wrap: wrap; gap: 6px 14px; padding: 9px 12px; margin-bottom: 9px; }
+  .overview-total { width: 100%; gap: 7px; }
+  .overview-total span, .overview-total strong { font-size: 22px; }
+  .overview-mini { margin-left: 0; gap: 14px; }
+  .overview-mini b { font-size: 15px; }
+  .overview-live { margin-left: auto; font-size: 10px; }
+
+  /* wallet strip */
+  .wallet-bar { align-items: stretch; flex-wrap: nowrap; gap: 6px; margin-bottom: 9px; overflow: hidden; }
+  .wallet-strip { width: auto; flex: 1 1 auto; overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; padding-bottom: 2px; }
+  .wallet-strip::-webkit-scrollbar { display: none; }
+  .wallet-tab { height: 34px; font-size: 13px; padding: 0 9px; white-space: nowrap; }
+  .wallet-tab small { font-size: 10px; }
+  .add-wallet { flex: none; height: 34px; font-size: 12px; padding: 0 8px; }
+
+  /* content / cards */
+  .content-grid { grid-template-columns: 1fr; gap: 10px; }
+  .rail { display: block; }
+  .panel, .rail-card { border-radius: 10px; }
+  .panel-head { flex-direction: column; align-items: stretch; gap: 8px; padding: 13px 14px 10px; }
+  .panel-head h2 { font-size: 21px; }
+  .panel-head p { font-size: 12px; }
+  .panel-tools { justify-content: space-between; }
+  .check-line { font-size: 12px; }
+  .toolbar { flex-wrap: wrap; gap: 7px; padding: 8px 14px; }
+  .search { width: 100%; height: 36px; }
+  .search input { height: 34px; font-size: 13px; }
+  .segmented { max-width: 100%; overflow-x: auto; }
+  .segmented button { height: 30px; font-size: 12px; }
+  .count { margin-left: auto; font-size: 12px; }
+  .notice { margin: 0; padding: 8px 14px; font-size: 12px; flex-wrap: wrap; gap: 5px; }
+  .notice .text-btn { font-size: 12px; }
+  .risk-panel { margin: 0 14px 8px; }
+  .risk-panel-grid { grid-template-columns: 1fr 1fr; }
+
+  /* mobile asset cards: all seven fields stay visible */
+  .asset-head { display: none; }
+  .asset-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      "asset value"
+      "price balance"
+      "liq tax"
+      "actions actions";
+    gap: 5px 10px;
+    min-height: 0;
+    padding: 11px 13px 10px;
+    align-items: start;
+    border-bottom: 1px solid var(--line-2);
+  }
+  .asset-row:last-child { border-bottom: 0; }
+  .cell-asset { grid-area: asset; min-width: 0; }
+  .asset-title-line { gap: 5px; flex-wrap: wrap; }
+  .asset-symbol { font-size: 21px; }
+  .asset-name { font-size: 12px; }
+  .asset-meta { margin-top: 2px; gap: 4px; }
+  .ca { font-size: 11px; max-width: 155px; }
+  .asset-meta .copy { width: 14px; height: 14px; }
+  .cell-asset .wallet-tags { margin-top: 4px; gap: 3px; }
+  .wallet-tag { font-size: 9px; padding: 0 4px; }
+  .wallet-more { font-size: 10px; }
+
+  .price, .balance, .value, .liq, .tax-cell {
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-start;
+    gap: 1px;
+    min-width: 0;
+    white-space: nowrap;
+  }
+  .price { grid-area: price; font-size: 14px; }
+  .balance { grid-area: balance; font-size: 15px; align-items: flex-end; text-align: right; }
+  .value { grid-area: value; font-size: 18px; align-items: flex-end; text-align: right; }
+  .liq { grid-area: liq; }
+  .liq b { font-size: 13px; }
+  .liq small { font-size: 9px; max-width: 140px; overflow: hidden; text-overflow: ellipsis; }
+  .tax-cell { grid-area: tax; font-size: 11px; align-items: flex-end; text-align: right; }
+
+  .price::before, .balance::before, .value::before, .liq::before, .tax-cell::before {
+    font-family: var(--font);
+    font-size: 9px;
+    font-weight: 600;
+    line-height: 1.2;
+    color: var(--ink-3);
+    letter-spacing: .02em;
+  }
+  .price::before { content: "价格"; }
+  .balance::before { content: "余额"; }
+  .value::before { content: "价值"; }
+  .liq::before { content: "流动性"; }
+  .tax-cell::before { content: "交易税"; }
+
+  .actions {
+    grid-area: actions;
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-start;
+    gap: 4px;
+    margin-top: 3px;
+    padding-top: 7px;
+    border-top: 1px solid var(--line-2);
+  }
+  .sell-group { display: flex; height: 32px; }
+  .sell-main { height: 32px; font-size: 12px; padding: 0 7px; }
+  .sell-caret { height: 32px; width: 22px; }
+  .row-text { height: 32px; font-size: 11px; padding: 0 6px; }
+  .kline-btn { height: 32px; font-size: 9px; padding: 0 4px; }
+  .kline-btn img { width: 12px; height: 12px; }
+  .mobile-pcts { display: none; }
+
+  .panel-foot { flex-direction: column; align-items: flex-start; gap: 3px; padding: 8px 14px; font-size: 10px; }
+  .holdings-panel > .disclaimer { padding: 0 14px 9px; font-size: 9px; }
+
+  /* wallet management below the holdings card */
+  .wallet-manage-card { margin-top: 0; }
+  .rail-head { padding: 10px 12px 5px; }
+  .rail-head h3 { font-size: 18px; }
+  .wallet-manage-list { padding: 0 8px; }
+  .manage-row { grid-template-columns: 24px minmax(0,1fr) auto 24px 24px; padding: 7px 3px; }
+  .manage-name-btn { font-size: 14px; }
+  .manage-sub { font-size: 10px; }
+  .manage-val { font-size: 14px; }
+  .manage-copy, .manage-del { width: 24px; height: 24px; }
+  .rail-card > .disclaimer { padding: 2px 12px 9px; font-size: 9px; }
+
+  /* history cards */
+  .history-panel { min-height: 0; }
+  .history-summary { grid-template-columns: 1fr 1fr; padding: 12px 14px; gap: 8px; }
+  .history-summary div { padding-left: 8px; }
+  .history-summary div:nth-child(2) { border-right: 0; }
+  .history-summary strong { font-size: 19px; }
+  .history-head { display: none; }
+  .history-row { grid-template-columns: 1fr auto; grid-template-areas: "time status" "asset asset" "wallet kind" "tx tx"; gap: 6px 10px; padding: 12px 14px; min-height: 0; font-size: 15px; }
+  .h-time { grid-area: time; display: flex; align-items: center; gap: 6px; }
+  .h-time small { display: none; }
+  .h-wallet { grid-area: wallet; }
+  .kind { grid-area: kind; justify-self: end; }
+  .h-status { grid-area: status; justify-self: end; }
+  .h-asset { grid-area: asset; }
+  .tx-link { grid-area: tx; justify-self: end; }
+
+  /* address book */
+  .book-panel { min-height: 0; }
+  .book-form { grid-template-columns: 1fr; gap: 6px; padding: 12px 14px; }
+  .book-list { padding: 12px 14px; }
+  .book-row { flex-wrap: wrap; gap: 8px; padding: 11px 12px; }
+  .book-name { font-size: 18px; }
+  .book-addr { font-size: 12px; }
+  .book-actions { width: 100%; justify-content: flex-start; gap: 5px; }
+  .book-btn { height: 32px; font-size: 12px; }
+  .agentic-addresses { padding: 11px 14px 6px; }
+  .agentic-head { flex-direction: column; align-items: flex-start; gap: 2px; }
+  .agentic-head h3 { font-size: 17px; }
+  .agentic-row { flex-wrap: wrap; gap: 6px; padding: 9px 0; }
+  .agentic-full { font-size: 11px; }
+  .agentic-actions { width: 100%; justify-content: flex-start; gap: 5px; }
+  .agentic-actions .book-btn { height: 32px; }
+  .notice + .risk-panel { margin-top: 0; }
+
+  /* modal sheets */
+  .modal { padding: 0; align-items: flex-end; }
+  .modal-card { width: 100%; max-height: 94dvh; border-radius: 16px 16px 0 0; border-bottom: 0; }
+  .modal-head { padding: 13px 14px; }
+  .modal-title h2 { font-size: 19px; }
+  .modal-title p { font-size: 12px; }
+  .modal-symbol { font-size: 24px; min-width: 42px; }
+  .sell-body, .send-body, .wallet-add-body { grid-template-columns: 1fr; }
+  .form-col, .wallet-add-form { padding: 13px 14px; }
+  .quote-col, .wallet-qr { border-left: 0; border-top: 1px solid var(--line-2); padding: 13px 14px; }
+  .quote-amount { font-size: 31px; }
+
+  /* send amount: manual field on its own row, percentages under it */
+  .send-amount-row { flex-wrap: wrap; gap: 6px; }
+  .send-amount-row .send-amount-input { flex: 1 1 100%; width: 100%; }
+  .send-amount-row .pct-row { flex: 1 1 100%; display: grid; grid-template-columns: repeat(3,1fr); gap: 5px; }
+  .send-amount-row .pct-row button { width: auto; min-width: 0; }
+  .recipient-tools { gap: 6px; }
+  .addr-quick { height: 36px; font-size: 13px; }
+  .own-wallet-picks { gap: 4px; }
+  .own-wallet-pick { min-height: 32px; }
+
+  /* sell: 2x2 equal cells, amount input full width, equal slip cells */
+  .sell-mode { width: 100%; display: grid; grid-template-columns: 1fr 1fr; }
+  .sell-mode button { width: 100%; }
+  .sell-pcts { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; }
+  .sell-pcts button, .sell-pcts .custom-pct { width: 100%; min-width: 0; height: 54px; }
+  .sell-pcts .custom-pct { padding: 3px 6px; }
+  .sell-amount-row { gap: 6px; }
+  .sell-amount-row input { width: 100%; min-width: 0; flex: 1; }
+  .slip-row { display: grid; grid-template-columns: repeat(5,1fr); gap: 5px; }
+  .slip-row .num-input { width: auto; flex: none; height: 40px; padding: 0 4px; }
+  .slip-row .num-input input { width: 100%; min-width: 0; height: 34px; font-size: 14px; }
+  .slip-quick { display: contents; }
+  .slip-quick button { width: auto; height: 40px; font-size: 11px; }
+  .sell-amount-row + .field-note, .send-amount-row + .field-note { font-size: 10px; }
+
+  /* receive QR fits a 360px screen */
+  .receive-card { width: calc(100vw - 24px); max-width: 390px; }
+  .receive-body { padding: 12px 14px 16px; }
+  .receive-qr-wrap { width: min(220px, 60vw); height: min(220px, 60vw); }
+  .receive-address { font-size: 11px; }
+
+  .holders-card { width: calc(100vw - 24px); }
+  .holders-list { padding: 8px 14px 14px; }
+  .holder-row { font-size: 14px; gap: 7px; }
+  .holder-val { font-size: 14px; }
+  .keepalive-modal-list { padding: 6px 14px 2px; }
+  .ka-row { grid-template-columns: 9px minmax(0,1fr) 84px auto; gap: 6px; font-size: 11px; padding: 7px 0; }
+  .ka-time { font-size: 10px; }
+  .keepalive-rule { padding: 9px 14px 14px; }
+
+  .app-foot { flex-direction: column; align-items: flex-start; gap: 4px; font-size: 10px; }
+  .toast-stack { left: 12px; right: 12px; bottom: 12px; max-width: none; }
+}
+
+@media (max-width: 380px) {
+  .app { padding: 10px 9px 16px; }
+  .hero-copy h1 { font-size: 22px; }
+  .overview-total span, .overview-total strong { font-size: 20px; }
+  .asset-row { padding: 10px 11px; }
+  .ca { max-width: 120px; }
+  .kline-btn { font-size: 8px; padding: 0 3px; }
+  .row-text { font-size: 10px; padding: 0 5px; }
+  .sell-main { font-size: 11px; padding: 0 6px; }
+  .manage-val { font-size: 13px; }
+}
+
+/* landscape phones: recover vertical space while keeping the card table */
+@media (max-width: 900px) and (orientation: landscape) {
+  .app { padding: 8px 12px 12px; }
+  .hero { flex-direction: row; align-items: center; gap: 8px; }
+  .hero-copy h1 { font-size: 21px; }
+  .hero-actions { width: auto; flex: 1 1 auto; justify-content: flex-end; }
+  .view-switch { width: auto; display: flex; }
+  .view-switch button { height: 32px; font-size: 12px; padding: 0 8px; }
+  .keepalive-entry { height: 32px; }
+  .hero-actions > .icon-btn { width: 32px; height: 32px; }
+  .overview { padding: 6px 10px; margin-bottom: 7px; }
+  .overview-total span, .overview-total strong { font-size: 18px; }
+  .overview-mini b { font-size: 13px; }
+  .wallet-bar { margin-bottom: 7px; }
+  .panel-head { flex-direction: row; align-items: center; padding: 9px 12px 7px; }
+  .toolbar { padding: 6px 12px; }
+  .asset-row { padding: 8px 12px; grid-template-areas: "asset value" "price balance" "liq tax" "actions actions"; }
+  .actions { padding-top: 5px; }
+  .asset-symbol { font-size: 18px; }
+  .wallet-tag { font-size: 8px; }
+  .panel-foot { flex-direction: row; align-items: center; }
+}
+
+@media (min-width:901px) and (max-width:1100px){
+  .price,.balance,.value,.liq,.tax-cell{display:flex;flex-direction:column;gap:1px}
+  .price{font-size:14px}
+  .balance{font-size:15px;align-items:flex-end;text-align:right}
+  .value{font-size:18px;align-items:flex-end;text-align:right}
+  .liq b{font-size:13px}
+  .liq small{font-size:9px}
+  .tax-cell{font-size:11px;align-items:flex-end;text-align:right}
+  .price::before,.balance::before,.value::before,.liq::before,.tax-cell::before{font-family:var(--font);font-size:9px;font-weight:600;line-height:1.2;color:var(--ink-3)}
+  .price::before{content:"价格"}.balance::before{content:"余额"}.value::before{content:"价值"}.liq::before{content:"流动性"}.tax-cell::before{content:"交易税"}
+}
