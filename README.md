@@ -25,7 +25,8 @@
 - **发送任意地址**：支持手动数量或百分比；可以直接发给任意 `0x` 地址，不要求先加入币安 App 地址簿。
 - **发送实现**：ERC-20 走 `contract-call` 的 `transfer(address,uint256)`；BNB 走原生 value 转账。地址簿只是可选便利功能，不是发送前置条件。
 - **钱包互转**：发送弹窗里直接选择 W1 → W2、W1 → W3、W1 → W4。
-- **本地地址簿**：只存在浏览器 localStorage；支持新增、修改、复制、发送、删除。
+- **交易记录**：合约调用会读取 BSC 交易回执里的 ERC-20 `Transfer` / 原生 BNB，尽量还原成“发送 / 接收 / 交易”和具体数量，不再只显示“合约 —”。
+- **本地地址簿**：只存在浏览器 localStorage；支持新增、修改、复制、发送、删除；发送弹窗会自动列出地址簿地址，点一下填入。
 - **完整地址复制**：钱包管理和地址簿都复制完整 `0x` 地址，不复制缩略地址。
 - **收款二维码**：服务端按当前钱包完整地址生成二维码，二维码下方再次显示完整地址。
 - **风险过滤**：默认隐藏小额、低流动性、貔貅、高税代币；过滤详情可展开。
@@ -476,7 +477,8 @@ Independent project. Not affiliated with or endorsed by Binance.
 - Sell by percentage or by token quantity, with quantity labels and estimated percentages.
 - Manual or percentage-based sends.
 - Send directly to another connected Agentic wallet (W1 → W2, W1 → W3, etc.).
-- Local browser address book with add, edit, copy, send, and delete.
+- Transaction history resolves contract calls through BSC receipts (ERC-20 `Transfer` / native BNB) into send/receive/trade rows with token amounts.
+- Local browser address book with add, edit, copy, send, and delete; saved addresses appear as quick picks inside the send dialog.
 - Full-address copy in wallet management and the address book.
 - Server-generated receive QR codes from the exact wallet address, with the full address shown underneath.
 - Risk filtering for dust, low liquidity, honeypots, and high-tax tokens, with collapsible details.

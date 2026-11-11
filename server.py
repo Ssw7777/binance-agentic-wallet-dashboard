@@ -786,9 +786,150 @@ def build_portfolio(wallet_filter: str = "all") -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------- history
+TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+_history_enrich_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+_token_meta_cache: dict[str, tuple[str, int]] = {}
+
+
+def _decode_abi_string(raw: Any) -> str:
+    try:
+        b = bytes.fromhex(str(raw or "")[2:])
+        if len(b) >= 64:
+            offset = int.from_bytes(b[:32], "big")
+            if offset + 32 <= len(b):
+                length = int.from_bytes(b[offset:offset + 32], "big")
+                return b[offset + 32:offset + 32 + length].decode("utf-8", "replace").strip("\x00 ")
+        return b.rstrip(b"\x00").decode("utf-8", "replace").strip("\x00 ")
+    except Exception:
+        return ""
+
+
+def _token_symbol(addr: str) -> str:
+    addr = addr.lower()
+    if addr == NATIVE:
+        return "BNB"
+    if addr == USDT:
+        return "USDT"
+    if addr == USDC:
+        return "USDC"
+    if addr == WBNB:
+        return "WBNB"
+    with _cache_lock:
+        cached = _token_meta_cache.get(addr)
+    if cached:
+        return cached[0]
+    try:
+        symbol = _decode_abi_string(rpc_call("eth_call", [{"to": addr, "data": "0x95d89b41"}, "latest"], timeout=6))
+    except Exception:
+        symbol = ""
+    symbol = symbol[:24] or short_addr(addr)
+    with _cache_lock:
+        _token_meta_cache[addr] = (symbol, 0)
+    return symbol
+
+
+def _history_amount(raw: Any, token: str) -> str:
+    try:
+        decimals = token_decimals(token)
+        qty = Decimal(int(str(raw), 16)) / (Decimal(10) ** decimals)
+        return fmt_qty(qty, token)
+    except Exception:
+        return ""
+
+
+def _enrich_contract_history(wallet: str, tx_hash: str) -> dict[str, Any]:
+    if not tx_hash:
+        return {}
+    now = time.time()
+    with _cache_lock:
+        cached = _history_enrich_cache.get(tx_hash)
+        if cached and now - cached[0] < 1800:
+            return cached[1]
+    result: dict[str, Any] = {}
+    try:
+        receipt = rpc_call("eth_getTransactionReceipt", [tx_hash], timeout=10)
+        tx = rpc_call("eth_getTransactionByHash", [tx_hash], timeout=10)
+        if not isinstance(receipt, dict) or not isinstance(tx, dict):
+            return {}
+        wallet_l = str(WALLET_BY_ID[wallet]["address"]).lower()
+        # A contract call can emit several ERC-20 Transfer logs. Match only
+        # transfers that involve this wallet, then describe the dominant flow.
+        transfers: list[dict[str, Any]] = []
+        for log in receipt.get("logs") or []:
+            topics = log.get("topics") or []
+            if len(topics) < 3 or str(topics[0]).lower() != TRANSFER_TOPIC:
+                continue
+            try:
+                from_addr = "0x" + str(topics[1])[-40:].lower()
+                to_addr = "0x" + str(topics[2])[-40:].lower()
+            except Exception:
+                continue
+            if wallet_l not in (from_addr, to_addr):
+                continue
+            token_addr = str(log.get("address") or "").lower()
+            amount = _history_amount(log.get("data"), token_addr)
+            if not amount:
+                continue
+            symbol = _token_symbol(token_addr)
+            transfers.append({
+                "token": token_addr, "symbol": symbol, "amount": amount,
+                "from": from_addr, "to": to_addr,
+                "direction": "out" if from_addr == wallet_l else "in",
+                "counterparty": to_addr if from_addr == wallet_l else from_addr,
+            })
+        # De-duplicate wrapping/duplicate logs.
+        unique: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for t in transfers:
+            unique[(t["token"], t["from"], t["to"])] = t
+        transfers = list(unique.values())
+        out = [t for t in transfers if t["direction"] == "out"]
+        inc = [t for t in transfers if t["direction"] == "in"]
+        if out and inc:
+            result = {
+                "kind": "交易",
+                "symbol": inc[0]["symbol"],
+                "amount": f"卖出 {out[0]['amount']} {out[0]['symbol']} → 收到 {inc[0]['amount']} {inc[0]['symbol']}",
+                "counterparty": short_addr(str(tx.get("to") or "")),
+                "contractAddress": str(tx.get("to") or ""),
+            }
+        elif out:
+            result = {
+                "kind": "发送",
+                "symbol": out[0]["symbol"],
+                "amount": f"{out[0]['amount']} {out[0]['symbol']}",
+                "counterparty": short_addr(out[0]["counterparty"]),
+                "contractAddress": out[0]["token"],
+            }
+        elif inc:
+            result = {
+                "kind": "接收",
+                "symbol": inc[0]["symbol"],
+                "amount": f"{inc[0]['amount']} {inc[0]['symbol']}",
+                "counterparty": short_addr(inc[0]["counterparty"]),
+                "contractAddress": inc[0]["token"],
+            }
+        else:
+            # Native BNB sent by a contract-call transaction.
+            value = int(str(tx.get("value") or "0x0"), 16)
+            if value > 0:
+                from_addr = str(tx.get("from") or "").lower()
+                to_addr = str(tx.get("to") or "").lower()
+                amount = _history_amount(hex(value), NATIVE)
+                if from_addr == wallet_l:
+                    result = {"kind": "发送", "symbol": "BNB", "amount": f"{amount} BNB", "counterparty": short_addr(to_addr), "contractAddress": to_addr}
+                elif to_addr == wallet_l:
+                    result = {"kind": "接收", "symbol": "BNB", "amount": f"{amount} BNB", "counterparty": short_addr(from_addr), "contractAddress": from_addr}
+    except Exception:
+        result = {}
+    with _cache_lock:
+        _history_enrich_cache[tx_hash] = (now, result)
+    return result
+
+
 def normalize_history(wallet: str, raw: dict[str, Any]) -> list[dict[str, Any]]:
     txs = ((raw.get("data") or {}).get("transactions") or []) if raw.get("success") else []
     out = []
+    contract_seen = 0
     for tx in txs:
         hashes = tx.get("txHashList") or []
         h = hashes[0] if hashes else {}
@@ -819,6 +960,16 @@ def normalize_history(wallet: str, raw: dict[str, Any]) -> list[dict[str, Any]]:
             if a and a.lower() != WALLET_BY_ID[wallet]["address"].lower():
                 counterparty = short_addr(a)
                 break
+        contract_address = ""
+        if tx_type == "contract_call" and contract_seen < 6:
+            contract_seen += 1
+            enriched = _enrich_contract_history(wallet, str(tx.get("txHash") or h.get("txHash") or ""))
+            if enriched:
+                kind = str(enriched.get("kind") or kind)
+                symbol = str(enriched.get("symbol") or symbol)
+                amount = str(enriched.get("amount") or amount)
+                counterparty = str(enriched.get("counterparty") or counterparty)
+                contract_address = str(enriched.get("contractAddress") or "")
         fee = ((h.get("networkFee") or {}).get("feeValue"))
         fee_bnb = 0.0
         if fee:
@@ -835,6 +986,7 @@ def normalize_history(wallet: str, raw: dict[str, Any]) -> list[dict[str, Any]]:
             "symbol": symbol,
             "amount": amount,
             "counterparty": counterparty,
+            "contractAddress": contract_address,
             "status": tx.get("status") or h.get("status") or "unknown",
             "txHash": tx.get("txHash") or h.get("txHash") or "",
             "feeBnb": round(fee_bnb, 8),

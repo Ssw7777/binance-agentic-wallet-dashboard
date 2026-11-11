@@ -382,7 +382,7 @@
         <div class="h-time"><strong>${esc(localTime(x.time))}</strong><small>${esc(String(x.time || "").slice(0, 10))}</small></div>
         <div class="h-wallet">${walletTag(walletById(x.wallet))}${esc(x.walletLabel || x.wallet)}</div>
         <div><span class="kind ${kindClass}">${esc(x.kind)}</span></div>
-        <div class="h-asset"><strong>${esc(x.amount || "—")}</strong><small>${esc(x.counterparty ? "对手方 " + x.counterparty : (x.symbol || ""))}</small></div>
+        <div class="h-asset"><strong>${esc(x.amount || (x.txType === "contract_call" ? "合约调用" : "—"))}</strong><small>${esc(x.counterparty ? "对手方 " + x.counterparty : x.contractAddress ? "合约 " + shortAddr(x.contractAddress) : (x.symbol || ""))}</small></div>
         <div class="h-status"><span class="status ${statusClass}">${statusText}</span></div>
         <div>${x.txHash ? `<a class="tx-link" href="https://bscscan.com/tx/${esc(x.txHash)}" target="_blank" rel="noopener">${esc(shortAddr(x.txHash))}<svg class="icon"><use href="#i-external"></use></svg></a>` : `<span class="tx-link">—</span>`}</div>
       </div>`;
@@ -516,6 +516,23 @@
         </div>
       </div>`).join("") : `<div class="book-empty">还没有地址，点右上角“添加地址”。</div>`;
     renderAgenticAddresses();
+    if (state.send) renderSendBookPicks();
+  }
+
+  function renderSendBookPicks() {
+    const box = $("#sendBookPicks");
+    if (!box) return;
+    const list = (state.book || []).filter((x) => /^0x[a-fA-F0-9]{40}$/.test(String(x.address || "")));
+    if (!list.length) {
+      box.hidden = true;
+      box.innerHTML = "";
+      return;
+    }
+    box.hidden = false;
+    box.innerHTML = `<span class="send-book-label">地址簿</span>` + list.slice(0, 6).map((x) => `
+      <button class="send-book-chip" type="button" data-send-book="${esc(x.address)}" title="${esc(x.address)}">
+        ${esc(x.name)}<small>${esc(shortAddr(x.address))}</small>
+      </button>`).join("");
   }
 
   function renderAgenticAddresses() {
@@ -997,6 +1014,7 @@
     $("#sendProgress").hidden = true;
     renderOwnWalletPicks();
     renderSendWallets();
+    renderSendBookPicks();
     renderSendSummary();
     $("#sendModal").classList.add("is-open");
     $("#sendModal").setAttribute("aria-hidden", "false");
@@ -1121,6 +1139,15 @@
         if (state.send.wallets.includes(w.id)) toast("注意", "收款地址也是本次发送钱包之一，请核对", "error");
         return;
       }
+      const sendBook = e.target.closest("[data-send-book]");
+      if (sendBook && state.send) {
+        const address = sendBook.dataset.sendBook;
+        if (!/^0x[a-fA-F0-9]{40}$/.test(address)) return toast("地址无效", "", "error");
+        state.send.recipient = address;
+        $("#recipientInput").value = address;
+        renderSendSummary();
+        return;
+      }
       const bookSend = e.target.closest("[data-book-send]");
       if (bookSend) { openSend(null, bookSend.dataset.bookSend); return; }
       const bookEdit = e.target.closest("[data-book-edit]");
@@ -1137,11 +1164,9 @@
       if (holders) { openHolders(holders.dataset.holders); return; }
       const okx = e.target.closest("#useOkxAddress");
       if (okx && state.send) {
-        const saved = (state.book || []).find((x) => /okx/i.test(x.name) && /^0x[a-fA-F0-9]{40}$/.test(x.address || ""));
+        const saved = (state.book || []).find((x) => /okx/i.test(x.name) && /^0x[a-fA-F0-9]{40}$/.test(String(x.address || "")));
         const address = saved?.address || OKX_ADDRESS;
-        if (!/^0x[a-fA-F0-9]{40}$/.test(address || "")) {
-          return toast("还没有 OKX 地址", "请先在地址簿添加 OKX 地址", "error");
-        }
+        if (!/^0x[a-fA-F0-9]{40}$/.test(String(address || ""))) return toast("还没有 OKX 地址", "先在地址簿添加，或直接手动粘贴", "error");
         state.send.recipient = address;
         $("#recipientInput").value = address;
         renderSendSummary();
