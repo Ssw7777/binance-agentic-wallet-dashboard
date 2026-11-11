@@ -845,10 +845,13 @@
         const tax = quote.tax || {};
         const buyTax = tax.buy == null ? "?" : tax.buy;
         const sellTax = tax.sell == null ? "?" : tax.sell;
-        $("#quoteTax").textContent = `买 ${buyTax}% / 卖 ${sellTax}%`;
-        $("#quoteTax").style.color = Number(tax.sell) > 10 ? "var(--red)" : "";
-        $("#taxAlert").hidden = !(Number(tax.sell) > 10);
-        $("#taxAlert").textContent = Number(tax.sell) > 10 ? `注意：该代币卖出税为 ${sellTax}%，成交后实际到账会明显减少；确认卖出时会再弹一次确认。` : "";
+        const taxUnknown = quote.taxUnknown === true;
+        $("#quoteTax").textContent = taxUnknown ? "买 ? / 卖 ?（未检测）" : `买 ${buyTax}% / 卖 ${sellTax}%`;
+        $("#quoteTax").style.color = (taxUnknown || Number(tax.sell) > 10) ? "var(--red)" : "";
+        $("#taxAlert").hidden = !(taxUnknown || Number(tax.sell) > 10);
+        $("#taxAlert").textContent = taxUnknown
+          ? "注意：该代币交易税尚未检测完成。仍然可以继续，但确认卖出时会额外弹窗提醒；成交后请核对实际到账。"
+          : Number(tax.sell) > 10 ? `注意：该代币卖出税为 ${sellTax}%，成交后实际到账会明显减少；确认卖出时会再弹一次确认。` : "";
         const dev = Number(quote.deviationPct) || 0;
         $("#quoteDeviation").textContent = fmtPct(dev);
         $("#quoteDeviation").style.color = quote.guard === "blocked" ? "var(--red)" : quote.guard === "warn" ? "var(--amber)" : "var(--green)";
@@ -894,6 +897,10 @@
     if (!state.sell || !state.sell.quote?.ok || state.sell.quote.guard === "blocked") return;
     const s = state.sell;
     const tax = s.quote?.tax || {};
+    const taxUnknown = s.quote?.taxUnknown === true;
+    if (taxUnknown) {
+      if (!confirm("该代币交易税尚未检测完成。\n可能包含买入税/卖出税，实际到账可能明显减少。\n确认继续卖出？")) return;
+    }
     if (Number(tax.sell) > 10) {
       if (!confirm(`该代币卖出税为 ${tax.sell}%（买入税 ${tax.buy ?? "?"}%）。\n税后实际到账会明显减少，确认继续卖出？`)) return;
     }
@@ -910,6 +917,7 @@
           pct: s.mode === "amount" ? null : s.pct,
           slippage: s.slippage || 1,
           taxAck: Number(tax.sell) > 10,
+          taxUnknownAck: taxUnknown,
           idempotencyKey: s.idem || (s.idem = "sell-" + Date.now() + "-" + Math.random().toString(36).slice(2))
         }
       });

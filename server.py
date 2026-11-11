@@ -942,12 +942,9 @@ def quote_for(wallet: str, token: str, qty: str, slippage: str | float = "auto")
         blocked_reason = "目标资产价格基准缺失，禁止提交"
     elif market_age > MARKET_STALE_SECONDS:
         blocked_reason = f"行情基准已过期（{int(market_age)} 秒），禁止提交"
-    elif not major and (tax.get("buy") is None or tax.get("sell") is None):
-        blocked_reason = "交易税尚未完成检测，禁止提交"
-    elif not major and audit.get("pending"):
-        blocked_reason = "风险检测进行中，禁止提交"
     elif not major and audit.get("hidden"):
         blocked_reason = "该代币被风险策略标记为貔貅/高税，禁止提交"
+    tax_unknown = bool(not major and (tax.get("buy") is None or tax.get("sell") is None))
 
     expected_usd = float(from_amount) * token_price
     actual_usd = float(to_amount) * target_price
@@ -980,7 +977,8 @@ def quote_for(wallet: str, token: str, qty: str, slippage: str | float = "auto")
         "baseline": "missing" if blocked_reason and ("基准" in blocked_reason or "过期" in blocked_reason) else "ok",
         "marketAgeSec": round(market_age, 1) if market_age < 1e8 else None,
         "tax": tax,
-        "needsTaxAck": bool(tax.get("sell") is not None and tax["sell"] > 10),
+        "taxUnknown": tax_unknown,
+        "needsTaxAck": bool(tax_unknown or (tax.get("sell") is not None and tax["sell"] > 10)),
         "pool": {
             "dex": m.get("dex"),
             "labels": m.get("labels"),
@@ -1130,7 +1128,7 @@ def add_audit(entry: dict[str, Any]) -> None:
         pass
 
 
-def run_sell_task(task: dict[str, Any], token: str, pct: float, slippage: float, amount: str | None = None, tax_ack: bool = False) -> None:
+def run_sell_task(task: dict[str, Any], token: str, pct: float, slippage: float, amount: str | None = None, tax_ack: bool = False, tax_unknown_ack: bool = False) -> None:
     token = token.lower()
     target = target_for(token)
     task["status"] = "running"
@@ -1138,7 +1136,7 @@ def run_sell_task(task: dict[str, Any], token: str, pct: float, slippage: float,
         with ThreadPoolExecutor(max_workers=min(3, len(task["legs"]))) as ex:
             futures = {}
             for leg in task["legs"]:
-                futures[ex.submit(sell_leg, leg, token, target, pct, slippage, tax_ack)] = leg
+                futures[ex.submit(sell_leg, leg, token, target, pct, slippage, tax_ack, tax_unknown_ack)] = leg
             for f in as_completed(futures):
                 leg = futures[f]
                 try:
@@ -1167,7 +1165,7 @@ def run_sell_task(task: dict[str, Any], token: str, pct: float, slippage: float,
         save_tasks()
 
 
-def sell_leg(leg: dict[str, Any], token: str, target: str, pct: float, slippage: float, tax_ack: bool = False) -> None:
+def sell_leg(leg: dict[str, Any], token: str, target: str, pct: float, slippage: float, tax_ack: bool = False, tax_unknown_ack: bool = False) -> None:
     wid = leg["wallet"]
     leg["status"] = "checking"
     ready_err = wallet_ready_error(wid)
@@ -1200,6 +1198,9 @@ def sell_leg(leg: dict[str, Any], token: str, target: str, pct: float, slippage:
         leg["quote"] = {k: pre.get(k) for k in ("toAmount", "toSymbol", "deviationPct", "guard", "slippagePct", "pool")}
         if pre.get("guard") == "blocked":
             leg.update(status="failed", error=f"报价偏离最优池 {pre.get('deviationPct')}% ，已拦截（保护）")
+            return
+        if pre.get("taxUnknown") and not tax_unknown_ack:
+            leg.update(status="failed", error="交易税未检测，需要确认后才能提交")
             return
         sell_tax = (pre.get("tax") or {}).get("sell")
         if sell_tax is not None and sell_tax > 10 and not tax_ack:
@@ -1323,9 +1324,11 @@ def start_sell(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("invalid slippage")
     idem = str(payload.get("idempotencyKey") or "") or None
     tax_ack = payload.get("taxAck") is True
+    tax_unknown_ack = payload.get("taxUnknownAck") is True
     fingerprint = hashlib.sha256(json.dumps({
         "kind": "sell", "token": token, "wallets": wallet_ids,
-        "amount": amount, "pct": pct, "slippage": slippage, "taxAck": tax_ack,
+        "amount": amount, "pct": pct, "slippage": slippage,
+        "taxAck": tax_ack, "taxUnknownAck": tax_unknown_ack,
     }, sort_keys=True).encode()).hexdigest()
     if amount is not None:
         balances: list[tuple[str, Decimal]] = []
@@ -1355,7 +1358,7 @@ def start_sell(payload: dict[str, Any]) -> dict[str, Any]:
     task = new_task("sell", legs, idem, fingerprint)
     if not claim_task(task):
         return task
-    threading.Thread(target=run_sell_task, args=(task, token, pct, slippage, amount, tax_ack), daemon=True).start()
+    threading.Thread(target=run_sell_task, args=(task, token, pct, slippage, amount, tax_ack, tax_unknown_ack), daemon=True).start()
     return task
 
 

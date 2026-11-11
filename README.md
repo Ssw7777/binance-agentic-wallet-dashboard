@@ -74,7 +74,7 @@ Python 标准库 HTTP 服务（server.py）
 - **新钱包默认只读**：新添加钱包的 `trade` 为 `false`，需要在钱包管理里确认开启后才能卖出/发送。
 - **发送不等于地址簿白名单**：发送使用 BAW `contract-call` 绕过币安 App 地址簿限制；新地址不会被钱包 App 提前拦截，必须由你在提交前核对完整地址。BAW 手机确认/风险控制仍然生效。
 - **后端二次检查**：卖出和发送都会重新检查钱包交易权限、BAW 交易锁，以及 BAW 当前 BSC 地址是否等于看板配置地址。
-- **报价保护**：行情基准缺失、超过 120 秒未更新、交易税未检测、貔貅/高税风险、或报价偏离最优池超过 8% 时，服务端会阻止提交。
+- **报价保护**：行情基准缺失、超过 120 秒未更新、貔貅/高税风险、或报价偏离最优池超过 8% 时，服务端会阻止提交。交易税未检测完成时不再永久卡死，会标记 `taxUnknown` 并要求二次确认后继续；真正检测到貔貅/高税仍会拦截。
 - **提交前重新报价**：服务端在提交前再次调用 BAW 报价；高税（>10%）还会要求 `taxAck`，不能只靠前端弹窗。
 - **任务记录**：任务写入 `data/tasks.json`；幂等键保留 24 小时；服务重启后未完成任务显示为“结果待核实”，不会自动重试。
 - **本地地址簿**：地址簿保存在当前浏览器 `localStorage`；提交转账时会把收款地址发给服务端和 BAW。
@@ -427,7 +427,8 @@ data/
 - 发送：BAW `contract-call`。ERC-20 调用 `transfer(address,uint256)`；BNB 用原生 value。**不需要地址簿白名单**。
 - 发送前服务端校验合约预览的收款地址、代币合约和数量；执行前仍可能触发币安手机确认。
 - 行情基准缺失、池子无流动性、或超过 **120 秒**未更新：阻止提交。
-- 交易税未完成检测、风险检测中、貔貅/高税：阻止提交。
+- 交易税未完成检测、风险检测中：标记 `taxUnknown`，前端二次确认 + 后端 `taxUnknownAck` 后允许继续；不会永久卡死。
+- 貔貅/高税：阻止提交。
 - 报价偏离最优池低于 **-8%**：拦截；**-3% 到 -8%**：提示。
 - 卖出税 **> 10%**：前端确认 + 服务端要求 `taxAck` 才提交。
 - 卖出前服务端会重新报价；BAW 当前只暴露 `--slippage`，没有独立的 min-receive 参数，最终成交以 BAW 报价和滑点为准。
@@ -511,7 +512,7 @@ Python stdlib HTTP server (server.py)
 - **New wallets are read-only.** New wallets start with `trade: false`; enable trading explicitly in wallet management.
 - **Sends bypass the address-book whitelist** via BAW `contract-call`. The Binance App will not pre-block a new address, so you must verify the full address before confirming. Binance phone confirmation/risk controls still apply.
 - **Backend checks.** Sell and send both re-check trade permission, the BAW transaction lock, and that the BAW BSC address matches the configured address.
-- **Quote guard.** Missing/stale market data (>120s), unknown tax, honeypot/high-tax risk, or a quote more than 8% below the best pool blocks submission.
+- **Quote guard.** Missing/stale market data (>120s), honeypot/high-tax risk, or a quote more than 8% below the best pool blocks submission. An unknown tax no longer blocks forever: it is marked `taxUnknown` and requires a second confirmation plus backend `taxUnknownAck`.
 - **Re-quote + tax ack.** The server re-quotes immediately before submission; sell tax above 10% requires a backend `taxAck`, not just a browser dialog.
 - **Persistent tasks.** Tasks are stored in `data/tasks.json`; idempotency keys last 24h; unfinished tasks become “result unknown” after a restart instead of retrying.
 - **Local address book.** Saved addresses stay in browser `localStorage`; a transfer submits the recipient to this server and BAW.
@@ -820,7 +821,8 @@ Mutating requests require `X-Requested-With: agentic` and JSON bodies.
 - Sends use BAW `contract-call`: ERC-20 `transfer(address,uint256)`; native BNB value transfer. **The Binance App address book is not required.**
 - The server verifies the preview's recipient, token contract, and amount before execute; Binance phone confirmation/risk controls can still apply.
 - Missing/stale baseline (>120s) or no pool liquidity: blocked.
-- Unknown tax, pending risk check, honeypot/high-tax: blocked.
+- Unknown tax / pending risk check: marked `taxUnknown`; browser confirmation plus backend `taxUnknownAck` allows the sell.
+- Honeypot/high-tax: blocked.
 - Quote below **-8%** vs. best pool: blocked; **-3% to -8%**: warning.
 - Sell tax **> 10%**: browser confirmation plus backend `taxAck`.
 - The server re-quotes immediately before submission. BAW currently exposes only `--slippage`, not an explicit min-receive field; final execution follows BAW's quote and slippage.
