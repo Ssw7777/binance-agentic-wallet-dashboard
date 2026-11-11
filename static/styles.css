@@ -1573,3 +1573,18 @@ body{font-size:18px}
   .tax-cell { font-size: 11px; }
   .actions { justify-content: flex-start; gap: 4px; }
 }
+@media (min-width: 1101px) {
+  .asset-head, .asset-row {
+    grid-template-columns:
+      minmax(180px, 1.4fr)
+      minmax(110px, 1fr)
+      minmax(120px, 1.2fr)
+      minmax(80px, .8fr)
+      minmax(100px, 1fr)
+      minmax(90px, .8fr)
+      minmax(260px, 2fr);
+    padding-left: 24px;
+    padding-right: 24px;
+  }
+  .price { font-size: 14px; }
+}
