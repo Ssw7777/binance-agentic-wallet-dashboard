@@ -21,7 +21,7 @@ import traceback
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, localcontext
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -77,6 +77,7 @@ _wallet_locks: dict[str, threading.Lock] = {}
 _audit_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="audit")
 _baw_pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="baw")
 _pending_wallets: dict[str, dict[str, Any]] = {}
+_relogin_pending: set[str] = set()
 _last_dex_error: str | None = None
 
 RISK_CONFIRM_RE = re.compile(
@@ -178,10 +179,17 @@ def wallet_address(slot: str) -> str:
 
 
 def wallet_ready_error(wallet: str, check_lock: bool = True) -> str | None:
-    """Backend-side permission/session checks shared by sell and send."""
+    """Backend-side permission/session checks shared by sell and send.
+
+    Call this while holding the wallet lock for any actual submission.
+    """
     w = WALLET_BY_ID.get(wallet)
     if not w:
         return "wallet not found"
+    if w.get("sessionBlocked"):
+        return "该钱包会话地址与绑定不一致，请重新登录恢复绑定"
+    if wallet in _relogin_pending:
+        return "该钱包正在重新登录，请稍后再试"
     if not w.get("trade"):
         return "该钱包未开启交易权限（只读）"
     expected = str(w.get("address") or "")
@@ -190,11 +198,20 @@ def wallet_ready_error(wallet: str, check_lock: bool = True) -> str | None:
         set_keepalive_status(wallet, "UNCONNECTED", "地址读取失败，会话可能已退出")
         return "BAW 会话已退出或地址读取失败，请重新登录"
     if expected and actual.lower() != expected.lower():
+        with _config_lock:
+            w["sessionBlocked"] = True
+            save_wallet_config()
+        set_keepalive_status(wallet, "MISMATCH", "会话地址与看板绑定不一致")
         return "BAW 会话地址与看板配置不一致，已阻止操作"
     if check_lock:
         lock = baw(wallet, ["wallet", "tx-lock", "--binanceChainId", CHAIN, "--json"], timeout=30)
-        if lock.get("success") and str((lock.get("data") or {}).get("status") or "").upper() == "LOCKED":
+        if not lock.get("success"):
+            return "无法确认交易锁状态，请稍后重试"
+        lock_status = str((lock.get("data") or {}).get("status") or "").upper()
+        if lock_status == "LOCKED":
             return "交易锁已开启，请先在币安 App 解锁"
+        if lock_status not in ("UNLOCKED", ""):
+            return f"交易锁状态未知（{lock_status}），已停止操作"
     return None
 
 
@@ -259,31 +276,53 @@ def token_decimals(token: str) -> int:
     return decimals
 
 
-def token_base_units(qty: Decimal, decimals: int) -> int:
+def token_base_units(qty: Decimal, decimals: int, truncate: bool = True) -> int:
     # Token balances can carry more decimal places than the token itself
-    # (for example 652.9205138214195022412 with 18 decimals).  Sending the
-    # truncated base-unit amount is exact on-chain and leaves only dust; it
-    # must not turn a 100% send into a hard failure.
-    scaled = qty * (Decimal(10) ** decimals)
-    units = int(scaled)
+    # (for example 652.9205138214195022412 with 18 decimals).  Percentage
+    # sends truncate to exact on-chain units and leave only dust; manual
+    # input must be rejected instead of silently changing the user's amount.
+    # Use explicit high precision so large values survive the 28-digit
+    # default Decimal context.
+    with localcontext() as ctx:
+        ctx.prec = 80
+        scaled = qty * (Decimal(10) ** decimals)
+        if not truncate and scaled != scaled.to_integral_value():
+            raise ValueError(f"数量小数位超过代币精度（{decimals} 位），请减少小数位")
+        units = int(scaled)
     if units <= 0:
         raise ValueError("数量过小")
     return units
 
 
-def build_transfer_call(token: str, qty: Decimal, recipient: str) -> tuple[str, str, str, int]:
+def build_transfer_call(token: str, qty: Decimal, recipient: str, truncate: bool = True) -> tuple[str, str, str, int]:
     token = token.lower()
     if token == NATIVE:
-        units = token_base_units(qty, 18)
+        units = token_base_units(qty, 18, truncate=truncate)
         return recipient, str(units), "0x", units
     decimals = token_decimals(token)
-    units = token_base_units(qty, decimals)
+    units = token_base_units(qty, decimals, truncate=truncate)
     data = (
         "0xa9059cbb"
         + recipient.lower().removeprefix("0x").rjust(64, "0")
         + format(units, "x").rjust(64, "0")
     )
     return token, "0", data, units
+
+
+def allocate_units(target_units: int, wallet_units: list[int]) -> list[int]:
+    """Split an exact base-unit target proportionally, never over-drawing."""
+    total = sum(wallet_units)
+    if target_units <= 0 or total <= 0 or target_units > total:
+        return []
+    shares = [min(w, target_units * w // total) for w in wallet_units]
+    remaining = target_units - sum(shares)
+    for i, w in enumerate(wallet_units):
+        if remaining <= 0:
+            break
+        extra = min(w - shares[i], remaining)
+        shares[i] += extra
+        remaining -= extra
+    return shares if remaining == 0 else []
 
 
 def preview_amount_matches(raw: Any, units: int) -> bool:
@@ -297,11 +336,14 @@ def preview_amount_matches(raw: Any, units: int) -> bool:
     return abs(shown - expected) <= tolerance
 
 
-def contract_send(wallet: str, token: str, qty: Decimal, recipient: str) -> dict[str, Any]:
+def contract_send(wallet: str, token: str, qty: Decimal, recipient: str, truncate: bool = True) -> dict[str, Any]:
     address = wallet_address(wallet)
     if not address:
         raise ValueError("无法读取当前 BAW 会话地址")
-    to, value, input_data, units = build_transfer_call(token, qty, recipient)
+    expected = str((WALLET_BY_ID.get(wallet) or {}).get("address") or "")
+    if expected and address.lower() != expected.lower():
+        raise ValueError("提交前 BAW 会话地址与看板绑定不一致，已停止")
+    to, value, input_data, units = build_transfer_call(token, qty, recipient, truncate=truncate)
     preview = baw(wallet, [
         "contract-call", "preview",
         "--binanceChainId", CHAIN,
@@ -330,7 +372,12 @@ def contract_send(wallet: str, token: str, qty: Decimal, recipient: str) -> dict
         return {"ok": False, "error": "合约预览没有返回 requestId"}
     execute = baw(wallet, ["contract-call", "execute", "--requestId", request_id, "--json"], timeout=100)
     if not execute.get("success"):
-        return {"ok": False, "needsPhoneConfirm": is_phone_confirm(execute), "error": err_text(execute)}
+        return {
+            "ok": False,
+            "needsPhoneConfirm": is_phone_confirm(execute),
+            "timeout": is_timeout(execute),
+            "error": "执行超时，链上结果待核实；请先查钱包记录，不要重复提交" if is_timeout(execute) else err_text(execute),
+        }
     data = execute.get("data") or {}
     if not isinstance(data, dict):
         data = {"result": data}
@@ -395,6 +442,10 @@ def is_locked(result: dict[str, Any]) -> bool:
     if result.get("success"):
         return False
     return bool(RISK_BLOCK_RE.search(err_text(result)))
+
+
+def is_timeout(result: dict[str, Any]) -> bool:
+    return "timeout" in err_text(result).lower()
 
 
 # ---------------------------------------------------------------- wallets / balances
@@ -692,10 +743,13 @@ def build_portfolio(wallet_filter: str = "all") -> dict[str, Any]:
         ka = _keepalive.get("wallets", {}).get(w["id"], {})
         ka_status = str(ka.get("status") or "").upper()
         session_status = "online" if ka_status == "CONNECTED" else ("offline" if ka_status else "checking")
+        if w.get("sessionBlocked"):
+            session_status = "blocked"
         wallets.append({
             **w,
             "status": session_status,
             "sessionStatus": session_status,
+            "sessionBlocked": bool(w.get("sessionBlocked")),
             "balanceStatus": "online" if item.get("ok") else "offline",
             "error": ka.get("error") or item.get("error"),
             "stale": bool(item.get("stale")),
@@ -843,8 +897,9 @@ def _enrich_contract_history(wallet: str, tx_hash: str) -> dict[str, Any]:
     if not tx_hash:
         return {}
     now = time.time()
+    cache_key = f"{wallet}:{tx_hash}"
     with _cache_lock:
-        cached = _history_enrich_cache.get(tx_hash)
+        cached = _history_enrich_cache.get(cache_key)
         if cached and now - cached[0] < 1800:
             return cached[1]
     result: dict[str, Any] = {}
@@ -880,9 +935,9 @@ def _enrich_contract_history(wallet: str, tx_hash: str) -> dict[str, Any]:
                 "counterparty": to_addr if from_addr == wallet_l else from_addr,
             })
         # De-duplicate wrapping/duplicate logs.
-        unique: dict[tuple[str, str, str], dict[str, Any]] = {}
+        unique: dict[tuple[str, str, str, str], dict[str, Any]] = {}
         for t in transfers:
-            unique[(t["token"], t["from"], t["to"])] = t
+            unique[(t["token"], t["from"], t["to"], t["amount"])] = t
         transfers = list(unique.values())
         out = [t for t in transfers if t["direction"] == "out"]
         inc = [t for t in transfers if t["direction"] == "in"]
@@ -924,7 +979,7 @@ def _enrich_contract_history(wallet: str, tx_hash: str) -> dict[str, Any]:
     except Exception:
         result = {}
     with _cache_lock:
-        _history_enrich_cache[tx_hash] = (now, result)
+        _history_enrich_cache[cache_key] = (now, result)
     return result
 
 
@@ -1178,12 +1233,19 @@ def qty_for_pct(wallet: str, token: str, pct: float) -> tuple[Decimal, str | Non
     qty, err = wallet_token_qty(wallet, token)
     if err:
         return Decimal(0), err
-    amount = qty * Decimal(str(pct)) / Decimal(100)
-    if pct >= 99.999 and token == NATIVE:
-        amount -= Decimal("0.0005")
+    with localcontext() as ctx:
+        ctx.prec = 80
+        amount = qty * Decimal(str(pct)) / Decimal(100)
+        if pct >= 99.999 and token == NATIVE:
+            amount -= Decimal("0.0005")
     if amount <= 0:
         return Decimal(0), "数量过小"
-    return amount, None
+    try:
+        decimals = token_decimals(token)
+        units = token_base_units(amount, decimals)
+    except ValueError as exc:
+        return Decimal(0), str(exc)
+    return Decimal(units) / (Decimal(10) ** decimals), None
 
 
 def parse_positive_amount(raw: Any) -> Decimal:
@@ -1316,7 +1378,9 @@ def run_sell_task(task: dict[str, Any], token: str, pct: float, slippage: float,
                     leg["status"] = "failed"
                     leg["error"] = repr(e)
         statuses = {l.get("status") for l in task["legs"]}
-        if "needs_confirm" in statuses:
+        if "unknown" in statuses:
+            task["status"] = "unknown"
+        elif "needs_confirm" in statuses:
             task["status"] = "needs_confirm"
         elif statuses <= {"submitted"}:
             task["status"] = "submitted"
@@ -1339,11 +1403,11 @@ def run_sell_task(task: dict[str, Any], token: str, pct: float, slippage: float,
 def sell_leg(leg: dict[str, Any], token: str, target: str, pct: float, slippage: float, tax_ack: bool = False, tax_unknown_ack: bool = False) -> None:
     wid = leg["wallet"]
     leg["status"] = "checking"
-    ready_err = wallet_ready_error(wid)
-    if ready_err:
-        leg.update(status="failed", error=ready_err)
-        return
     with _wallet_locks[wid]:
+        ready_err = wallet_ready_error(wid)
+        if ready_err:
+            leg.update(status="failed", error=ready_err)
+            return
         if leg.get("fixedQty"):
             try:
                 qty = Decimal(str(leg["fixedQty"]))
@@ -1387,6 +1451,8 @@ def sell_leg(leg: dict[str, Any], token: str, target: str, pct: float, slippage:
         if not r.get("success"):
             if is_phone_confirm(r):
                 leg.update(status="needs_confirm", error=err_text(r))
+            elif is_timeout(r):
+                leg.update(status="unknown", error="执行超时，链上结果待核实；请先查钱包记录，不要重复提交")
             else:
                 leg.update(status="failed", error=err_text(r))
             return
@@ -1413,7 +1479,9 @@ def run_send_task(task: dict[str, Any], token: str, pct: float, recipient: str, 
                     leg["status"] = "failed"
                     leg["error"] = str(e) or repr(e)
         statuses = {l.get("status") for l in task["legs"]}
-        if "needs_confirm" in statuses:
+        if "unknown" in statuses:
+            task["status"] = "unknown"
+        elif "needs_confirm" in statuses:
             task["status"] = "needs_confirm"
         elif statuses <= {"submitted"}:
             task["status"] = "submitted"
@@ -1433,14 +1501,30 @@ def run_send_task(task: dict[str, Any], token: str, pct: float, recipient: str, 
         save_tasks()
 
 
+CONFIRM_STATUSES = {
+    "PENDING_CONFIRMATION", "NEEDS_CONFIRMATION", "NEEDS_CONFIRM",
+    "WAITING_CONFIRMATION", "REQUIRE_CONFIRMATION", "CONFIRMATION_REQUIRED",
+}
+FAILED_STATUSES = {"FAILED", "REJECTED", "CANCELLED", "CANCELED", "ERROR"}
+
+
+def classify_execute_status(data: dict[str, Any]) -> str:
+    status = str(data.get("status") or "").upper()
+    if data.get("requireConfirmation") is True or status in CONFIRM_STATUSES:
+        return "needs_confirm"
+    if status in FAILED_STATUSES:
+        return "failed"
+    return "submitted"
+
+
 def send_leg(leg: dict[str, Any], token: str, pct: float, recipient: str, amount: str | None = None) -> None:
     wid = leg["wallet"]
     leg["status"] = "checking"
-    ready_err = wallet_ready_error(wid)
-    if ready_err:
-        leg.update(status="failed", error=ready_err)
-        return
     with _wallet_locks[wid]:
+        ready_err = wallet_ready_error(wid)
+        if ready_err:
+            leg.update(status="failed", error=ready_err)
+            return
         if amount is not None:
             try:
                 qty = Decimal(str(amount))
@@ -1459,23 +1543,29 @@ def send_leg(leg: dict[str, Any], token: str, pct: float, recipient: str, amount
         leg["qty"] = q
         leg["status"] = "submitting"
         try:
-            result = contract_send(wid, token, qty, recipient)
+            result = contract_send(wid, token, qty, recipient, truncate=amount is None)
         except Exception as e:  # noqa: BLE001
             leg.update(status="failed", error=str(e) or repr(e))
             return
         if not result.get("ok"):
             if result.get("needsPhoneConfirm"):
                 leg.update(status="needs_confirm", error=result.get("error"))
+            elif result.get("timeout"):
+                leg.update(status="unknown", error=result.get("error"))
             else:
                 leg.update(status="failed", error=result.get("error"))
             return
         data = result.get("data") or {}
-        tx_hash = data.get("txHash") or data.get("txId") or data.get("hash") or data.get("orderId")
-        status = str(data.get("status") or "").upper()
-        if data.get("requireConfirmation") is True or "CONFIRM" in status:
-            leg.update(status="needs_confirm", txHash=tx_hash, error="需要到币安 App 确认这笔合约调用")
+        tx_hash = data.get("txHash") or data.get("txId") or data.get("hash")
+        order_id = data.get("orderId")
+        outcome = classify_execute_status(data)
+        if outcome == "needs_confirm":
+            leg.update(status="needs_confirm", txHash=tx_hash, orderId=order_id, error="需要到币安 App 确认这笔合约调用")
             return
-        leg.update(status="submitted", txHash=tx_hash, result=data)
+        if outcome == "failed":
+            leg.update(status="failed", error=str(data.get("message") or data.get("error") or data.get("status") or "failed"))
+            return
+        leg.update(status="submitted", txHash=tx_hash, orderId=order_id, result=data)
 
 
 def start_sell(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1508,26 +1598,34 @@ def start_sell(payload: dict[str, Any]) -> dict[str, Any]:
         "taxAck": tax_ack, "taxUnknownAck": tax_unknown_ack,
     }, sort_keys=True).encode()).hexdigest()
     if amount is not None:
-        balances: list[tuple[str, Decimal]] = []
-        total_qty = Decimal(0)
+        try:
+            decimals = token_decimals(token)
+            target_units = token_base_units(Decimal(amount), decimals, truncate=False)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+        balances: list[tuple[str, int]] = []
         for w in wallet_ids:
             qty, err = wallet_token_qty(w, token)
             if err or qty <= 0:
                 continue
-            balances.append((w, qty))
-            total_qty += qty
-        if total_qty <= 0:
+            balances.append((w, token_base_units(qty, decimals)))
+        total_units = sum(units for _, units in balances)
+        if total_units <= 0:
             raise ValueError("no token balance")
-        if Decimal(amount) > total_qty:
+        if target_units > total_units:
             raise ValueError("amount exceeds selected wallet balance")
+        shares = allocate_units(target_units, [units for _, units in balances])
+        if not shares:
+            raise ValueError("no sellable amount")
         legs = []
-        remaining = Decimal(amount)
-        for idx, (w, qty) in enumerate(balances):
-            share = remaining if idx == len(balances) - 1 else (Decimal(amount) * qty / total_qty)
-            share = min(share, qty)
-            if share > 0:
-                legs.append({"wallet": w, "status": "queued", "fixedQty": str(share)})
-            remaining -= share
+        for (w, _), units in zip(balances, shares):
+            if units <= 0:
+                continue
+            qty = Decimal(units) / (Decimal(10) ** decimals)
+            fixed = format(qty, "f")
+            if "." in fixed:
+                fixed = fixed.rstrip("0").rstrip(".")
+            legs.append({"wallet": w, "status": "queued", "fixedQty": fixed or "0"})
         if not legs:
             raise ValueError("no sellable amount")
     else:
@@ -1558,6 +1656,11 @@ def start_send(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("invalid token/wallet/recipient")
     if amount is None and not (0 < pct <= 100):
         raise ValueError("invalid pct")
+    if amount is not None:
+        try:
+            token_base_units(Decimal(amount), token_decimals(token), truncate=False)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
     idem = str(payload.get("idempotencyKey") or "") or None
     fingerprint = hashlib.sha256(json.dumps({
         "kind": "send", "token": token, "wallets": wallet_ids,
@@ -1631,17 +1734,26 @@ def start_wallet_relogin(wallet_id: str) -> dict[str, Any]:
     w = WALLET_BY_ID.get(wallet_id)
     if not w:
         return {"ok": False, "error": "wallet not found"}
+    if wallet_id in _relogin_pending:
+        return {"ok": False, "error": "该钱包已有扫码请求，请完成或等待过期后再试"}
+    _relogin_pending.add(wallet_id)
     now_ms = int(time.time() * 1000)
     for pending_slot, pending in list(_pending_wallets.items()):
         if int(pending.get("expireAt") or 0) and int(pending["expireAt"]) < now_ms - 3_600_000:
             _pending_wallets.pop(pending_slot, None)
-    r = baw(wallet_id, ["auth", "signin", "--json"], timeout=70)
+    try:
+        r = baw(wallet_id, ["auth", "signin", "--json"], timeout=70)
+    except Exception:
+        _relogin_pending.discard(wallet_id)
+        raise
     if not r.get("success"):
+        _relogin_pending.discard(wallet_id)
         return {"ok": False, "error": err_text(r)}
     data = r.get("data") or {}
     url = str(data.get("urlForWeb") or "")
     qr_id = str(data.get("qrCodeId") or "")
     if not url or not qr_id:
+        _relogin_pending.discard(wallet_id)
         return {"ok": False, "error": "BAW 没有返回二维码"}
     expire_at = int(data.get("expireAt") or 0)
     expires_in = max(0, int(expire_at / 1000 - time.time())) if expire_at > 10_000_000_000 else 300
@@ -1671,7 +1783,7 @@ def start_wallet_relogin(wallet_id: str) -> dict[str, Any]:
     }
 
 
-def _verify_wallet(slot: str, qr_id: str) -> None:
+def _verify_wallet_inner(slot: str, qr_id: str) -> None:
     pending = _pending_wallets.get(slot)
     if not pending:
         return
@@ -1690,11 +1802,16 @@ def _verify_wallet(slot: str, qr_id: str) -> None:
     if existing:
         expected = str(pending.get("expectedAddress") or "")
         if expected and addr.lower() != expected.lower():
+            with _config_lock:
+                existing["sessionBlocked"] = True
+                save_wallet_config()
             pending["status"] = "failed"
-            pending["error"] = f"扫码钱包地址与 {slot} 原地址不一致，未替换"
+            pending["error"] = f"扫码钱包地址与 {slot} 原地址不一致，该钱包已锁定；请用原钱包重新登录恢复"
+            set_keepalive_status(slot, "MISMATCH", str(pending["error"]))
             return
         with _config_lock:
             existing["address"] = addr
+            existing["sessionBlocked"] = False
             save_wallet_config()
     else:
         duplicate = next((w for w in WALLETS if str(w.get("address") or "").lower() == addr.lower()), None)
@@ -1724,6 +1841,13 @@ def _verify_wallet(slot: str, qr_id: str) -> None:
     except Exception:
         pass
     threading.Thread(target=lambda: history_for(slot), daemon=True).start()
+
+
+def _verify_wallet(slot: str, qr_id: str) -> None:
+    try:
+        _verify_wallet_inner(slot, qr_id)
+    finally:
+        _relogin_pending.discard(slot)
 
 
 def pending_wallet(slot: str) -> dict[str, Any]:

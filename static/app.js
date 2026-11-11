@@ -212,6 +212,7 @@
   }
 
   function sessionLabel(w) {
+    if (w.sessionBlocked) return "地址不一致";
     if (w.sessionStatus === "online" || w.status === "online") return "在线";
     if (w.sessionStatus === "checking" || w.status === "checking") return "检测中";
     return "已退出";
@@ -259,7 +260,7 @@
       <div class="manage-row">
         <span class="manage-dot" style="--wc:${w.color}"></span>
         <div class="manage-main">
-          <div class="manage-name"><button class="manage-name-btn" data-rename-wallet="${esc(w.id)}" type="button" title="点击修改名称">${esc(w.label)} <svg class="icon"><use href="#i-pen"></use></svg></button><small class="${w.status === "online" ? "" : "off"}">${w.stale ? "缓存 · " : ""}${esc(sessionLabel(w))}${w.status === "offline" ? " · 需要重新登录或移除" : ""}</small><button class="trade-toggle ${w.trade ? "on" : "off"}" data-trade-wallet="${esc(w.id)}" type="button" title="${w.trade ? "当前可交易，点击设为只读" : "当前只读，点击开启交易"}">${w.trade ? "交易开" : "只读"}</button>${w.status === "offline" ? `<button class="relogin-btn" data-relogin-wallet="${esc(w.id)}" type="button">重新登录</button>` : ""}</div>
+          <div class="manage-name"><button class="manage-name-btn" data-rename-wallet="${esc(w.id)}" type="button" title="点击修改名称">${esc(w.label)} <svg class="icon"><use href="#i-pen"></use></svg></button><small class="${w.status === "online" ? "" : "off"}">${w.stale ? "缓存 · " : ""}${esc(sessionLabel(w))}${w.status === "offline" || w.sessionBlocked ? " · 需要重新登录或移除" : ""}</small><button class="trade-toggle ${w.trade ? "on" : "off"}" data-trade-wallet="${esc(w.id)}" type="button" title="${w.trade ? "当前可交易，点击设为只读" : "当前只读，点击开启交易"}">${w.trade ? "交易开" : "只读"}</button>${w.status === "offline" || w.sessionBlocked ? `<button class="relogin-btn" data-relogin-wallet="${esc(w.id)}" type="button">重新登录</button>` : ""}</div>
           <div class="manage-sub">${esc(w.id)} · ${esc(shortAddr(w.address))}</div>
         </div>
         <div class="manage-val">${fmtUsd(w.balanceUsd)}</div>
@@ -273,7 +274,7 @@
     const ka = state.portfolio.keepalive?.wallets || {};
     const wallets = state.portfolio.wallets || [];
     const checked = wallets.filter((w) => ka[w.id]).length;
-    const online = wallets.filter((w) => ka[w.id]?.status === "CONNECTED").length;
+    const online = wallets.filter((w) => !w.sessionBlocked && ka[w.id]?.status === "CONNECTED").length;
     const allOk = wallets.length > 0 && online === wallets.length;
     const entry = $("#keepaliveBtn");
     entry.classList.toggle("ok", allOk);
@@ -283,8 +284,8 @@
     $("#keepaliveModalList").innerHTML = wallets.length ? wallets.map((w) => {
       const k = ka[w.id];
       const status = k?.status || "UNKNOWN";
-      const ok = status === "CONNECTED";
-      const label = ok ? "在线" : status === "UNCONNECTED" ? "已退出" : status === "UNKNOWN" ? "未知" : status;
+      const ok = status === "CONNECTED" && !w.sessionBlocked;
+      const label = w.sessionBlocked ? "地址不一致" : ok ? "在线" : status === "UNCONNECTED" ? "已退出" : status === "UNKNOWN" ? "未知" : status;
       return `<div class="ka-row ${ok ? "" : "off"}"><span class="ka-dot ${ok ? "" : "off"}"></span><span class="ka-name">${esc(w.label)}</span><span class="ka-state">${esc(label)}</span><span class="ka-time">${k?.at ? timeAgo(k.at) : "未检查"}</span>${ok ? "" : `<button class="ka-login" data-relogin-wallet="${esc(w.id)}" type="button">重新登录</button>`}</div>`;
     }).join("") : `<div class="manage-empty">暂无会话</div>`;
   }
@@ -822,12 +823,20 @@
 
   let quoteTimer = null;
   function scheduleQuote() {
+    if (state.sell) {
+      state.sell.quote = null;
+      $("#sellConfirm").disabled = true;
+      $("#quoteGuard").className = "guard";
+      $("#quoteGuard").textContent = "数量/钱包已变化，等待新报价…";
+    }
     clearTimeout(quoteTimer);
     quoteTimer = setTimeout(fetchQuote, 180);
   }
 
   async function fetchQuote() {
     if (!state.sell) return;
+    state.sell.quote = null;
+    $("#sellConfirm").disabled = true;
     const { token, wallets, mode, amount, pct, autoSlip, slippage } = state.sell;
     if (!wallets.length) {
       $("#quoteAmount").textContent = "—";
@@ -981,10 +990,10 @@
       const terminal = ["submitted", "partial", "failed", "needs_confirm", "unknown"].includes(task.status);
       const head = `<div class="progress-head"><strong>${task.status === "submitted" ? "已提交" : task.status === "needs_confirm" ? "等待手机确认" : task.status === "partial" ? "部分成功" : task.status === "unknown" ? "结果待核实" : task.status === "failed" ? "失败" : "正在提交"}</strong><span>${esc(task.status)}</span></div>`;
       progress.innerHTML = head + (task.legs || []).map((leg) => {
-        const status = leg.status === "submitted" ? "done" : leg.status === "needs_confirm" ? "wait" : leg.status === "failed" ? "fail" : "";
-        const text = leg.status === "submitted" ? "已提交" : leg.status === "needs_confirm" ? "需手机确认" : leg.status === "failed" ? "失败" : "进行中";
-        return `<div class="leg ${status}"><span class="leg-ico"><svg class="icon"><use href="#${status === "done" ? "i-check" : status === "fail" ? "i-alert" : "i-clock"}"></use></svg></span><span class="leg-main"><strong>${esc(walletById(leg.wallet).label)}</strong><small>${esc(leg.txHash || leg.error || leg.qty || "准备中")}</small></span><span class="leg-state">${text}</span></div>`;
-      }).join("") + `<p class="modal-note">任务 ID：${esc(task.id || id)}</p>` + (task.error ? `<p class="modal-note">错误：${esc(String(task.error).split("\n").filter(Boolean).slice(-1)[0])}</p>` : "");
+        const status = leg.status === "submitted" ? "done" : leg.status === "needs_confirm" || leg.status === "unknown" ? "wait" : leg.status === "failed" ? "fail" : "";
+        const text = leg.status === "submitted" ? "已提交" : leg.status === "needs_confirm" ? "需手机确认" : leg.status === "unknown" ? "结果待核实" : leg.status === "failed" ? "失败" : "进行中";
+        return `<div class="leg ${status}"><span class="leg-ico"><svg class="icon"><use href="#${status === "done" ? "i-check" : status === "fail" ? "i-alert" : "i-clock"}"></use></svg></span><span class="leg-main"><strong>${esc(walletById(leg.wallet).label)}</strong><small>${esc(leg.txHash || (leg.orderId ? "订单 " + leg.orderId : leg.error || leg.qty || "准备中"))}</small></span><span class="leg-state">${text}</span></div>`;
+      }).join("") + `<p class="modal-note">任务 ID：${esc(task.id || id)}</p>` + (task.error ? `<p class="modal-note">错误：${esc(String(task.error).split("\n").filter(Boolean).slice(-1)[0])}</p>` : "") + (["unknown", "failed", "needs_confirm"].includes(task.status) ? `<button class="text-btn" type="button" data-task-recheck="${esc(task.id || id)}" data-task-kind="${esc(kind)}">重新查询任务</button>` : "");
       if (!terminal) continue;
       if (task.status === "needs_confirm") {
         if (kind === "sell") $("#sellPhone").hidden = false;
@@ -1019,11 +1028,14 @@
     let holders = token.holders || [];
     if (state.wallet !== "all") holders = holders.filter((h) => h.wallet === state.wallet);
     if (!holders.length) return toast("没有可发送的钱包", "切换钱包后再试", "error");
-    const online = holders.filter((h) => walletById(h.wallet)?.status === "online");
+    const usable = holders.filter((h) => {
+      const w = walletById(h.wallet);
+      return w?.status === "online" && w?.trade && !w?.sessionBlocked;
+    });
     let selected = [];
-    if (state.wallet !== "all" && online.some((h) => h.wallet === state.wallet)) selected = [state.wallet];
-    else if (online.length) selected = [online[0].wallet];
-    if (!online.length) toast("持有钱包已退出", "先在钱包管理点“重新登录”，再发送", "error");
+    if (state.wallet !== "all" && usable.some((h) => h.wallet === state.wallet)) selected = [state.wallet];
+    else if (usable.length) selected = [usable[0].wallet];
+    if (!usable.length) toast("没有可用发送钱包", "持有钱包已退出、只读或地址不一致；先在钱包管理处理", "error");
     state.send = { token, holders, wallets: selected, mode: "manual", amount: "", pct: null, recipient: presetRecipient || "" };
     $("#sendSymbolBig").textContent = String(token.symbol || "?").toUpperCase();
     $("#sendTitle").textContent = `发送 ${token.symbol}`;
@@ -1038,6 +1050,7 @@
     renderSendSummary();
     $("#sendModal").classList.add("is-open");
     $("#sendModal").setAttribute("aria-hidden", "false");
+    setTimeout(() => $("#recipientInput")?.focus(), 100);
   }
 
   function renderSendWallets() {
@@ -1045,12 +1058,15 @@
     const { token, holders, wallets } = state.send;
     $("#sendWallets").innerHTML = holders.map((h) => {
       const w = walletById(h.wallet);
-      const offline = w.status !== "online";
-      return `<label class="pick ${wallets.includes(h.wallet) ? "is-on" : ""} ${offline ? "is-off" : ""}">
-        <input type="checkbox" data-send-wallet="${h.wallet}" ${wallets.includes(h.wallet) ? "checked" : ""} ${offline ? "disabled" : ""}>
+      const blocked = w.sessionBlocked || w.status !== "online" || !w.trade;
+      const reason = w.sessionBlocked ? "地址不一致，需重新登录"
+        : w.status !== "online" ? "会话已退出，需重新登录"
+        : !w.trade ? "只读，需先开启交易" : esc(shortAddr(w.address));
+      return `<label class="pick ${wallets.includes(h.wallet) ? "is-on" : ""} ${blocked ? "is-off" : ""}">
+        <input type="checkbox" data-send-wallet="${h.wallet}" ${wallets.includes(h.wallet) ? "checked" : ""} ${blocked ? "disabled" : ""}>
         <span class="pick-box"><svg class="icon"><use href="#i-check"></use></svg></span>
         ${walletTag(w)}
-        <span class="pick-name"><strong>${esc(w.label)}</strong><small>${offline ? "会话已退出，需重新登录" : esc(shortAddr(w.address))}</small></span>
+        <span class="pick-name"><strong>${esc(w.label)}</strong><small>${reason}</small></span>
         <span class="pick-bal">${fmtQty(h.qty)} ${esc(token.symbol)}<small>${fmtUsd(h.value)}</small></span>
       </label>`;
     }).join("");
@@ -1160,6 +1176,8 @@
         if (state.send.wallets.includes(w.id)) toast("注意", "收款地址也是本次发送钱包之一，请核对", "error");
         return;
       }
+      const recheck = e.target.closest("[data-task-recheck]");
+      if (recheck) { pollTask(recheck.dataset.taskRecheck, recheck.dataset.taskKind || "send"); return; }
       const relogin = e.target.closest("[data-relogin-wallet]");
       if (relogin) { openWalletModal(relogin.dataset.reloginWallet); return; }
       const sendBook = e.target.closest("[data-send-book]");

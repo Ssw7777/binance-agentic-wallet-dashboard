@@ -24,10 +24,11 @@
 - **按比例 / 按数量卖出**：两种模式二选一；每个比例下面显示对应数量，输入数量时显示约占比。
 - **发送任意地址**：支持手动数量或百分比；可以直接发给任意 `0x` 地址，不要求先加入币安 App 地址簿。
 - **发送实现**：ERC-20 走 `contract-call` 的 `transfer(address,uint256)`；BNB 走原生 value 转账。地址簿只是可选便利功能，不是发送前置条件。
-- **余额精度**：有些代币余额的小数位会比链上 `decimals` 更多；发送时按链上精度向下截断，最多留下极小 dust，不会因为多一位小数直接失败。
+- **余额精度**：比例发送会把比例结果按链上 `decimals` 向下取整到整数最小单位；手输数量超过精度会明确提示，不会被偷偷改金额；多钱包按数量卖出时使用同一套整数最小单位分配，避免预览与执行各算一遍。
+- **大额精度**：最小单位换算使用 80 位 Decimal 上下文，避免默认 28 位把大额余额末尾截掉。
 - **离线钱包**：会话已退出的钱包不能勾选发送，必须先在钱包管理里“重新登录”；发送失败会在弹窗里显示每个钱包的具体原因。
 - **钱包互转**：发送弹窗里直接选择 W1 → W2、W1 → W3、W1 → W4。
-- **交易记录**：合约调用会读取 BSC 交易回执里的 ERC-20 `Transfer` / 原生 BNB，尽量还原成“发送 / 接收 / 交易”和具体数量，不再只显示“合约 —”。
+- **交易记录**：合约调用会读取 BSC 交易回执里的 ERC-20 `Transfer` / 原生 BNB，尽量还原成“发送 / 接收 / 交易”和具体数量，不再只显示“合约 —”。同一笔交易按当前钱包地址分别解析并缓存，W1 看是发送、W2 看是接收，不会串视角。
 - **本地地址簿**：只存在浏览器 localStorage；支持新增、修改、复制、发送、删除；发送弹窗会自动列出地址簿地址，点一下填入。
 - **完整地址复制**：钱包管理和地址簿都复制完整 `0x` 地址，不复制缩略地址。
 - **收款二维码**：服务端按当前钱包完整地址生成二维码，二维码下方再次显示完整地址。
@@ -81,6 +82,8 @@ Python 标准库 HTTP 服务（server.py）
 - **报价保护**：行情基准缺失、超过 120 秒未更新、貔貅/高税风险、或报价偏离最优池超过 8% 时，服务端会阻止提交。交易税未检测完成时不再永久卡死，会标记 `taxUnknown` 并要求二次确认后继续；真正检测到貔貅/高税仍会拦截。
 - **提交前重新报价**：服务端在提交前再次调用 BAW 报价；高税（>10%）还会要求 `taxAck`，不能只靠前端弹窗。
 - **任务记录**：任务写入 `data/tasks.json`；幂等键保留 24 小时；服务重启后未完成任务显示为“结果待核实”，不会自动重试。
+- **状态与恢复**：只把明确的待确认状态识别为“需手机确认”，`CONFIRMED` 不会误判；订单 ID 和链上 txHash 分开保存；执行超时显示“结果待核实”，弹窗里提供“重新查询任务”按钮。
+- **提交锁**：卖出/发送在钱包锁内复查交易权限、绑定地址和交易锁；交易锁查询失败或返回未知状态会停止，不会当作通过。重新登录期间该钱包不能提交，且同一钱包只允许一个扫码请求；扫码地址不匹配会锁定该钱包并提示恢复绑定。
 - **本地地址簿**：地址簿保存在当前浏览器 `localStorage`；提交转账时会把收款地址发给服务端和 BAW。
 - **日志脱敏**：请求日志不记录请求体/Cookie，并会去掉查询字符串中的地址。
 - **不可撤销**：链上转账和交易不可撤销，提交前请核对地址、网络、代币、数量、滑点和税。
@@ -517,9 +520,11 @@ Python stdlib HTTP server (server.py)
 - **New wallets are read-only.** New wallets start with `trade: false`; enable trading explicitly in wallet management.
 - **Sends bypass the address-book whitelist** via BAW `contract-call`. The Binance App will not pre-block a new address, so you must verify the full address before confirming. Binance phone confirmation/risk controls still apply.
 - **Backend checks.** Sell and send both re-check trade permission, the BAW transaction lock, and that the BAW BSC address matches the configured address.
-- **Quote guard.** Missing/stale market data (>120s), honeypot/high-tax risk, or a quote more than 8% below the best pool blocks submission. An unknown tax no longer blocks forever: it is marked `taxUnknown` and requires a second confirmation plus backend `taxUnknownAck`.
+- **Quote guard.** Missing/stale market data (>120s), honeypot/high-tax risk, or a quote more than 8% below the best pool blocks submission. An unknown tax no longer blocks forever: it is marked `taxUnknown` and requires a second confirmation plus backend `taxUnknownAck`. Changing amount/wallets invalidates the visible quote and disables confirmation until the new quote arrives.
+- **Execution status.** Only explicit confirmation states become `needs_confirm`; `CONFIRMED` is not treated as confirmation. Order IDs and transaction hashes are separate. Execution timeouts become `unknown` with a re-query button, not silent failure.
+- **Submission lock.** Sell/send re-check trade permission, bound address, and tx-lock inside the per-wallet lock. Unknown lock state stops. Re-login blocks submissions for that wallet and allows only one QR request; address mismatch locks the wallet until re-bound.
 - **Re-quote + tax ack.** The server re-quotes immediately before submission; sell tax above 10% requires a backend `taxAck`, not just a browser dialog.
-- **Persistent tasks.** Tasks are stored in `data/tasks.json`; idempotency keys last 24h; unfinished tasks become “result unknown” after a restart instead of retrying.
+- **Persistent tasks.** Tasks are stored in `data/tasks.json`; idempotency keys last 24h; unfinished tasks become “result unknown” after a restart instead of retrying. Timeouts are also `unknown`, with a re-query button in the modal.
 - **Local address book.** Saved addresses stay in browser `localStorage`; a transfer submits the recipient to this server and BAW.
 - **Redacted logs.** No bodies/cookies are logged; query strings containing addresses are redacted.
 
@@ -824,8 +829,9 @@ Mutating requests require `X-Requested-With: agentic` and JSON bodies.
 - Price reference: DexScreener deepest-liquidity pool.
 - Sells use BAW `market-order swap`.
 - Sends use BAW `contract-call`: ERC-20 `transfer(address,uint256)`; native BNB value transfer. **The Binance App address book is not required.**
-- Extra balance precision is truncated to the token's on-chain decimals, leaving at most dust instead of failing.
-- Logged-out wallets cannot be selected for sends; re-login first. Failures show per-wallet reasons in the modal.
+- Percentage amounts are truncated to exact on-chain base units; manual input that exceeds token decimals is rejected explicitly. Multi-wallet amount sells allocate integer base units.
+- Large values use an 80-digit Decimal context, so the default 28-digit context cannot truncate the tail.
+- Logged-out/read-only/mismatched wallets cannot be selected for sends; re-login first. Failures show per-wallet reasons in the modal.
 - The server verifies the preview's recipient, token contract, and amount before execute; Binance phone confirmation/risk controls can still apply.
 - Missing/stale baseline (>120s) or no pool liquidity: blocked.
 - Unknown tax / pending risk check: marked `taxUnknown`; browser confirmation plus backend `taxUnknownAck` allows the sell.
