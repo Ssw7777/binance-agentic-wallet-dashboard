@@ -1540,3 +1540,15 @@ body{font-size:18px}
   .trade-toggle{height:20px;font-size:10px}
   .send-full-address{font-size:10px;text-align:left}
 }
+/* desktop column fit: keep long tiny prices and large balances on one line */
+@media (min-width: 1101px) {
+  .asset-head, .asset-row { grid-template-columns: minmax(160px, 1.5fr) 102px 122px 80px 92px 82px 245px; gap: 6px; padding-left: 18px; padding-right: 18px; }
+  .price { font-size: 14px; font-weight: 700; }
+  .balance { font-size: 17px; }
+  .value { font-size: 18px; }
+  .tax-cell { font-size: 11px; }
+  .liq b { font-size: 13px; }
+  .liq small { font-size: 9px; }
+  .actions { gap: 4px; }
+  .kline-btn { font-size: 10px; padding: 0 4px; }
+}
