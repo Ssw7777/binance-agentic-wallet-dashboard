@@ -155,13 +155,25 @@ def qr_svg(data: str) -> str:
         return ""
 
 
+def set_keepalive_status(wallet: str, status: str, error: str | None = None) -> None:
+    with _cache_lock:
+        current = _keepalive.setdefault("wallets", {})
+        current[wallet] = {"at": now_iso(), "status": status, "error": error}
+        _keepalive["at"] = now_iso()
+    save_keepalive()
+
+
 def wallet_address(slot: str) -> str:
     r = baw(slot, ["wallet", "address", "--json"], timeout=45)
     if not r.get("success"):
+        code = str(((r.get("error") or {}).get("name") or "") if isinstance(r.get("error"), dict) else "")
+        set_keepalive_status(slot, "UNCONNECTED" if code == "NOT_LOGGED_IN" else "UNKNOWN", err_text(r))
         return ""
     for item in ((r.get("data") or {}).get("addresses") or []):
         if str(item.get("binanceChainId")) == CHAIN:
+            set_keepalive_status(slot, "CONNECTED", None)
             return str(item.get("address") or "")
+    set_keepalive_status(slot, "UNKNOWN", "BAW 没有返回 BSC 地址")
     return ""
 
 
@@ -175,7 +187,8 @@ def wallet_ready_error(wallet: str, check_lock: bool = True) -> str | None:
     expected = str(w.get("address") or "")
     actual = wallet_address(wallet)
     if not actual:
-        return "无法读取当前 BAW 会话地址，请检查会话"
+        set_keepalive_status(wallet, "UNCONNECTED", "地址读取失败，会话可能已退出")
+        return "BAW 会话已退出或地址读取失败，请重新登录"
     if expected and actual.lower() != expected.lower():
         return "BAW 会话地址与看板配置不一致，已阻止操作"
     if check_lock:
@@ -675,10 +688,14 @@ def build_portfolio(wallet_filter: str = "all") -> dict[str, Any]:
             if not risk.get("hidden"):
                 visible += value
         ka = _keepalive.get("wallets", {}).get(w["id"], {})
+        ka_status = str(ka.get("status") or "").upper()
+        session_status = "online" if ka_status == "CONNECTED" else ("offline" if ka_status else "checking")
         wallets.append({
             **w,
-            "status": "online" if item.get("ok") else "offline",
-            "error": item.get("error"),
+            "status": session_status,
+            "sessionStatus": session_status,
+            "balanceStatus": "online" if item.get("ok") else "offline",
+            "error": ka.get("error") or item.get("error"),
             "stale": bool(item.get("stale")),
             "updatedAt": item.get("updatedAt"),
             "balanceUsd": round(total, 2),
@@ -1555,24 +1572,36 @@ def save_keepalive() -> None:
 
 def keepalive_once() -> None:
     global _keepalive
-    out = {}
-    for w in WALLETS:
-        r = baw(w["id"], ["wallet", "status", "--json"], timeout=30)
-        st = str(((r.get("data") or {}).get("status") or ("CONNECTED" if r.get("success") else "UNKNOWN"))).upper()
-        out[w["id"]] = {"at": now_iso(), "status": st, "error": None if r.get("success") else err_text(r)}
+    out: dict[str, dict[str, Any]] = {}
+
+    def check(w: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        try:
+            r = baw(w["id"], ["wallet", "status", "--json"], timeout=20)
+            raw = str(((r.get("data") or {}).get("status") or ("CONNECTED" if r.get("success") else "UNKNOWN"))).upper()
+            return w["id"], {
+                "at": now_iso(),
+                "status": raw if raw in ("CONNECTED", "UNCONNECTED") else "UNKNOWN",
+                "error": None if r.get("success") else err_text(r),
+            }
+        except Exception as exc:  # noqa: BLE001
+            return w["id"], {"at": now_iso(), "status": "UNKNOWN", "error": repr(exc)[:160]}
+
+    with ThreadPoolExecutor(max_workers=max(1, min(6, len(WALLETS)))) as pool:
+        for wid, state in pool.map(check, WALLETS):
+            out[wid] = state
     with _cache_lock:
         _keepalive = {"wallets": out, "at": now_iso()}
     save_keepalive()
 
 
 def keepalive_loop() -> None:
-    time.sleep(8)
+    time.sleep(3)
     while True:
         try:
             keepalive_once()
         except Exception:
             pass
-        time.sleep(3600)
+        time.sleep(15)
 
 
 def data_loop() -> None:

@@ -210,6 +210,12 @@
     renderAgenticAddresses();
   }
 
+  function sessionLabel(w) {
+    if (w.sessionStatus === "online" || w.status === "online") return "在线";
+    if (w.sessionStatus === "checking" || w.status === "checking") return "检测中";
+    return "已退出";
+  }
+
   function renderWalletTabs() {
     const p = state.portfolio;
     const active = state.view === "history" ? state.historyWallet : state.wallet;
@@ -219,7 +225,7 @@
       <button class="wallet-tab ${active === w.id ? "is-active" : ""}" data-wallet="${w.id}" type="button">
         <span class="dot" style="--wc:${w.color}"></span>${esc(w.label)}
         <b>${fmtUsd(w.balanceUsd)}</b>
-        ${w.status === "online" ? "" : `<small class="off">掉线</small>`}
+        ${w.status === "online" ? "" : `<small class="off">${esc(sessionLabel(w))}</small>`}
       </button>`).join("");
     $("#walletTabs").innerHTML = all + rest;
   }
@@ -252,7 +258,7 @@
       <div class="manage-row">
         <span class="manage-dot" style="--wc:${w.color}"></span>
         <div class="manage-main">
-          <div class="manage-name"><button class="manage-name-btn" data-rename-wallet="${esc(w.id)}" type="button" title="点击修改名称">${esc(w.label)} <svg class="icon"><use href="#i-pen"></use></svg></button><small>${w.stale ? "缓存" : w.status === "online" ? "在线" : "掉线"}</small><button class="trade-toggle ${w.trade ? "on" : "off"}" data-trade-wallet="${esc(w.id)}" type="button" title="${w.trade ? "当前可交易，点击设为只读" : "当前只读，点击开启交易"}">${w.trade ? "交易开" : "只读"}</button></div>
+          <div class="manage-name"><button class="manage-name-btn" data-rename-wallet="${esc(w.id)}" type="button" title="点击修改名称">${esc(w.label)} <svg class="icon"><use href="#i-pen"></use></svg></button><small>${w.stale ? "缓存 · " : ""}${esc(sessionLabel(w))}</small><button class="trade-toggle ${w.trade ? "on" : "off"}" data-trade-wallet="${esc(w.id)}" type="button" title="${w.trade ? "当前可交易，点击设为只读" : "当前只读，点击开启交易"}">${w.trade ? "交易开" : "只读"}</button></div>
           <div class="manage-sub">${esc(w.id)} · ${esc(shortAddr(w.address))}</div>
         </div>
         <div class="manage-val">${fmtUsd(w.balanceUsd)}</div>
@@ -275,9 +281,10 @@
     entry.title = !checked ? "等待首次保活检查" : allOk ? `全部 ${wallets.length} 个会话正常` : `${wallets.length - online} 个会话异常，点击查看`;
     $("#keepaliveModalList").innerHTML = wallets.length ? wallets.map((w) => {
       const k = ka[w.id];
-      const status = k?.status || "未知";
+      const status = k?.status || "UNKNOWN";
       const ok = status === "CONNECTED";
-      return `<div class="ka-row ${ok ? "" : "off"}"><span class="ka-dot ${ok ? "" : "off"}"></span><span class="ka-name">${esc(w.label)}</span><span class="ka-state">${esc(status)}</span><span class="ka-time">${k?.at ? timeAgo(k.at) : "未检查"}</span></div>`;
+      const label = ok ? "在线" : status === "UNCONNECTED" ? "已退出" : status === "UNKNOWN" ? "未知" : status;
+      return `<div class="ka-row ${ok ? "" : "off"}"><span class="ka-dot ${ok ? "" : "off"}"></span><span class="ka-name">${esc(w.label)}</span><span class="ka-state">${esc(label)}</span><span class="ka-time">${k?.at ? timeAgo(k.at) : "未检查"}</span></div>`;
     }).join("") : `<div class="manage-empty">暂无会话</div>`;
   }
 

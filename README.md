@@ -30,7 +30,8 @@
 - **收款二维码**：服务端按当前钱包完整地址生成二维码，二维码下方再次显示完整地址。
 - **风险过滤**：默认隐藏小额、低流动性、貔貅、高税代币；过滤详情可展开。
 - **交易税提醒**：买卖税显示在持仓表和卖出弹窗；卖出税高于 10% 会再额外确认一次。
-- **后台保活**：每小时对每个会话执行 `baw wallet status`；右上角绿/红状态，点开看每个钱包。
+- **会话状态**：每 15 秒并行执行 `baw wallet status`；在币安 App 退出登录后，钱包标签和管理列表会显示“已退出”，右上角状态变红。发送/卖出失败时也会立即标记对应会话，不必等下一轮。
+- **后台保活**：持续检查会话；右上角绿/红状态，点开看每个钱包。
 - **钱包管理**：重命名、复制地址、扫码添加、从看板移除。
 - **双端布局**：桌面端、手机竖屏、手机横屏分别适配。
 
@@ -343,7 +344,7 @@ sudo systemctl restart agentic-wallet
 - 备份 `data/`（钱包配置、历史缓存、审计记录）
 - 备份 `~/aw/` 前先确认权限；里面是 BAW 会话，属于敏感数据
 - Binance 会话过期时，手机 App 重新扫码登录对应 `wN`
-- 保活每小时执行一次 `baw wallet status`，但**不能代替币安自身的登录有效期**
+- 每 15 秒检查一次 `baw wallet status`，但**不能代替币安自身的登录有效期**
 - 不要把 `data/`、`~/aw/`、Cookie、密码或二维码截图提交到 GitHub
 
 ### 10. 常驻运行检查清单
@@ -480,7 +481,7 @@ Independent project. Not affiliated with or endorsed by Binance.
 - Server-generated receive QR codes from the exact wallet address, with the full address shown underneath.
 - Risk filtering for dust, low liquidity, honeypots, and high-tax tokens, with collapsible details.
 - Buy/sell tax visibility; sells above 10% tax require a second confirmation.
-- Hourly keepalive using `baw wallet status`, with green/red status in the header.
+- Session status checked every 15 seconds via `baw wallet status`, with green/red status in the header. Logging out in the Binance App changes the wallet badge to “已退出” within one interval; a failed send/sell marks it immediately.
 - Wallet rename, address copy, QR onboarding, and dashboard removal.
 - Desktop, phone portrait, and phone landscape layouts.
 
@@ -754,7 +755,7 @@ sudo systemctl restart agentic-wallet
 - Back up `data/` (wallet config, history cache, audit log).
 - Treat `~/aw/` as sensitive BAW session state.
 - Re-scan the Binance App QR when a session expires.
-- Hourly keepalive runs `baw wallet status`; it does not replace Binance login expiry.
+- Session status is checked every 15 seconds with `baw wallet status`; it does not replace Binance login expiry. Logging out in the Binance App changes the badge to “已退出” within one interval, and a failed send/sell updates it immediately.
 - Never commit `data/`, `~/aw/`, cookies, passwords, or QR screenshots.
 
 ### 10. Always-on checklist
