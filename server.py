@@ -1736,7 +1736,15 @@ def start_wallet_relogin(wallet_id: str) -> dict[str, Any]:
         return {"ok": False, "error": "wallet not found"}
     if wallet_id in _relogin_pending:
         return {"ok": False, "error": "该钱包已有扫码请求，请完成或等待过期后再试"}
-    _relogin_pending.add(wallet_id)
+    lock = _wallet_locks.setdefault(wallet_id, threading.Lock())
+    if not lock.acquire(blocking=False):
+        return {"ok": False, "error": "该钱包正在提交交易，请稍后再重新登录"}
+    try:
+        if wallet_id in _relogin_pending:
+            return {"ok": False, "error": "该钱包已有扫码请求，请完成或等待过期后再试"}
+        _relogin_pending.add(wallet_id)
+    finally:
+        lock.release()
     now_ms = int(time.time() * 1000)
     for pending_slot, pending in list(_pending_wallets.items()):
         if int(pending.get("expireAt") or 0) and int(pending["expireAt"]) < now_ms - 3_600_000:
