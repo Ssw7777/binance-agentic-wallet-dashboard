@@ -1,5 +1,15 @@
 # Security
 
+## Use at your own risk
+
+This project is experimental and provided under the MIT License **“AS IS”**,
+without any warranty. You are solely responsible for your wallets, sessions,
+addresses, transactions, tax/compliance obligations, and any loss. See
+[DISCLAIMER.md](DISCLAIMER.md).
+
+The author and contributors are not liable for lost assets, wrong addresses,
+failed transactions, third-party outages, or compromised sessions.
+
 ## Reporting
 
 Do not open a public issue containing wallet addresses, QR payloads, session

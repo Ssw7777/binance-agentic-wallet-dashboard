@@ -4,6 +4,12 @@
 
 > 本项目是独立自托管工具，不是 Binance 官方产品，与 Binance 无隶属关系。
 
+## ⚠️ 风险声明 / Risk Disclaimer
+
+**中文：** 本项目仅供学习、研究、自托管工具参考，不构成投资、财务、法律、税务或安全建议。软件按 MIT “AS IS” 提供，不保证可用性、准确性或持续维护。链上交易不可撤销；使用本项目产生的资产损失、转错地址、税/滑点/貔貅、第三方服务或合规问题，均由使用者自行承担。请先小额测试，并完整阅读 **[风险声明](DISCLAIMER.md)** 与 **[安全说明](SECURITY.md)**。
+
+**English:** This project is for learning, research, and self-hosted tooling reference only. It is not investment, financial, legal, tax, or security advice. Provided under MIT “AS IS”, without warranty of availability, accuracy, or maintenance. On-chain transactions are irreversible; you are solely responsible for asset loss, wrong addresses, tax/slippage/honeypot risk, third-party services, and compliance. Test with small amounts and read the full **[Risk Disclaimer](DISCLAIMER.md)** and **[Security](SECURITY.md)**.
+
 ---
 
 # 中文版
@@ -452,9 +458,9 @@ python3 -m unittest discover -s tests -v
 
 ## 免责声明
 
-本项目仅供自托管、个人学习和自用。加密资产和链上交易不可撤销；价格、流动性、税费、报价和余额都可能延迟或出错。每次操作前请在币安 App 和区块浏览器核对收款地址、网络、代币合约、数量、滑点和税。作者不对任何资金损失负责。
+本项目仅供自托管、个人学习和工具参考，不构成投资、财务、法律、税务或安全建议。加密资产和链上交易不可撤销；价格、流动性、税费、报价和余额都可能延迟或出错。每次操作前请在币安 App 和区块浏览器核对收款地址、网络、代币合约、数量、滑点和税。作者和贡献者不对任何资金损失、交易失败、第三方服务或合规问题负责。
 
-本项目不是 Binance 官方产品，与 Binance 无隶属或背书关系。
+本项目不是 Binance 官方产品，与 Binance 无隶属或背书关系。完整条款见 **[DISCLAIMER.md](DISCLAIMER.md)**；安全边界见 **[SECURITY.md](SECURITY.md)**。
 
 ## 许可证
 
@@ -852,9 +858,9 @@ Coverage includes integer amount formatting, invalid amounts, tax sanitization, 
 
 ## Disclaimer
 
-Provided for self-hosted personal use and learning. Crypto assets and on-chain transactions are irreversible. Prices, liquidity, taxes, quotes, and balances may be delayed or wrong. Always verify the recipient address, network, token contract, amount, slippage, and tax in Binance and on-chain before confirming. The authors are not responsible for financial loss.
+Provided for self-hosted personal use and tooling reference only. This is not investment, financial, legal, tax, or security advice. Crypto assets and on-chain transactions are irreversible. Prices, liquidity, taxes, quotes, and balances may be delayed or wrong. Always verify the recipient address, network, token contract, amount, slippage, and tax in Binance and on-chain before confirming. The authors and contributors are not responsible for financial loss, failed transactions, third-party services, or compliance issues.
 
-Not affiliated with or endorsed by Binance.
+Not affiliated with or endorsed by Binance. Read the full **[Risk Disclaimer](DISCLAIMER.md)** and **[Security](SECURITY.md)**.
 
 ## License
 
