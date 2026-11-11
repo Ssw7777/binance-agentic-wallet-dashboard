@@ -271,6 +271,17 @@ def build_transfer_call(token: str, qty: Decimal, recipient: str) -> tuple[str, 
     return token, "0", data, units
 
 
+def preview_amount_matches(raw: Any, units: int) -> bool:
+    """Compare preview amount without losing JS-number precision on huge values."""
+    try:
+        shown = Decimal(str(raw))
+    except Exception:
+        return False
+    expected = Decimal(units)
+    tolerance = max(Decimal(1), abs(expected) * Decimal("0.000000001"))
+    return abs(shown - expected) <= tolerance
+
+
 def contract_send(wallet: str, token: str, qty: Decimal, recipient: str) -> dict[str, Any]:
     address = wallet_address(wallet)
     if not address:
@@ -297,11 +308,8 @@ def contract_send(wallet: str, token: str, qty: Decimal, recipient: str) -> dict
         return {"ok": False, "error": "合约预览收款地址不一致，已阻止"}
     if token != NATIVE and str(parsed.get("contractAddress") or "").lower() != token:
         return {"ok": False, "error": "合约预览代币地址不一致，已阻止"}
-    try:
-        if int(parsed.get("amount")) != units:
-            return {"ok": False, "error": "合约预览数量不一致，已阻止"}
-    except Exception:
-        return {"ok": False, "error": "合约预览数量缺失，已阻止"}
+    if not preview_amount_matches(parsed.get("amount"), units):
+        return {"ok": False, "error": "合约预览数量不一致，已阻止"}
     request_id = str(pdata.get("requestId") or "")
     if not request_id:
         return {"ok": False, "error": "合约预览没有返回 requestId"}
