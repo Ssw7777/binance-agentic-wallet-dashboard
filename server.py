@@ -1403,7 +1403,7 @@ def run_sell_task(task: dict[str, Any], token: str, pct: float, slippage: float,
 def sell_leg(leg: dict[str, Any], token: str, target: str, pct: float, slippage: float, tax_ack: bool = False, tax_unknown_ack: bool = False) -> None:
     wid = leg["wallet"]
     leg["status"] = "checking"
-    with _wallet_locks[wid]:
+    with _wallet_locks.setdefault(wid, threading.Lock()):
         ready_err = wallet_ready_error(wid)
         if ready_err:
             leg.update(status="failed", error=ready_err)
@@ -1520,7 +1520,7 @@ def classify_execute_status(data: dict[str, Any]) -> str:
 def send_leg(leg: dict[str, Any], token: str, pct: float, recipient: str, amount: str | None = None) -> None:
     wid = leg["wallet"]
     leg["status"] = "checking"
-    with _wallet_locks[wid]:
+    with _wallet_locks.setdefault(wid, threading.Lock()):
         ready_err = wallet_ready_error(wid)
         if ready_err:
             leg.update(status="failed", error=ready_err)
