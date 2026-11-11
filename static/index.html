@@ -57,7 +57,7 @@
         <div><span>可见资产</span><b id="visibleUsd">—</b></div>
         <div><span>隐藏 / 风险</span><b id="hiddenUsd" class="warn">—</b></div>
       </div>
-      <div class="overview-live"><i class="live-dot"></i> 3 秒刷新</div>
+      <div class="overview-live"><i class="live-dot" id="dataDot"></i><span id="dataFreshness">3 秒刷新</span></div>
     </section>
 
     <div class="wallet-bar" id="walletBar">
@@ -300,7 +300,8 @@
           <div class="quote-card">
             <div class="quote-label">发送摘要</div>
             <div class="kv"><span>代币</span><b id="sendTokenLabel">—</b></div>
-            <div class="kv"><span>地址</span><b id="sendAddressLabel">—</b></div>
+            <div class="kv"><span>地址</span><b id="sendAddressLabel" class="send-full-address">—</b></div>
+            <div class="kv"><span>网络</span><b>BSC</b></div>
             <div class="kv"><span>钱包</span><b id="sendWalletLabel">—</b></div>
             <div class="kv"><span>合计</span><b id="sendTotalLabel">—</b></div>
           </div>
@@ -330,7 +331,7 @@
             <input id="walletLabel" class="text-input" type="text" maxlength="20" placeholder="例如：新号 / 朋友号">
           </div>
           <button id="walletStart" class="btn primary full" type="button">生成扫码二维码</button>
-          <p id="walletStatus" class="wallet-status">扫码后会自动创建独立 BAW 会话，不会导入私钥。</p>
+          <p id="walletStatus" class="wallet-status">扫码后会自动创建独立 BAW 会话，不会导入私钥。新钱包默认只读，添加后可在钱包管理开启交易。</p>
         </div>
         <div id="walletQR" class="wallet-qr" hidden>
           <div id="walletQRBox" class="wallet-qr-box"></div>

@@ -52,7 +52,17 @@ Python 标准库 HTTP 服务（server.py）
         +-- BSC RPC（原生余额）
 ```
 
-浏览器只访问同源 `/api/*`；钱包地址、BAW 会话和配置文件不会离开服务器。
+浏览器只访问同源 `/api/*`。**钱包完整地址会进入浏览器**用于复制、地址簿和收款二维码；BAW 会话文件、配置文件和服务器端缓存仍只保存在服务器。
+
+### 数据会经过谁
+
+- **浏览器**：拿到当前钱包的完整地址、余额、交易记录、二维码和任务状态；地址簿保存在浏览器 `localStorage`。
+- **本服务**：保存钱包配置、BAW 会话路径、缓存、任务记录和审计日志；不会保存私钥或助记词。
+- **BAW / Binance**：执行登录、余额、报价、发送和交易，接收其所需的钱包会话和交易参数。
+- **DexScreener / honeypot.is / BSC RPC**：接收代币或池子地址、链上读取请求。
+- **服务器日志**：只记录请求行和状态，不记录请求体、Cookie 或交易私密内容；带地址的查询参数会脱敏为 `?[redacted]`。
+
+地址簿中的地址在发送时会提交给服务端，服务器再交给 BAW。配对链接和配对码在有效期内属于敏感信息，不要截图外传。生产环境请限制日志访问权限，并定期清理 `data/` 中不需要的任务/历史缓存。
 
 ## 安全说明
 
@@ -60,8 +70,13 @@ Python 标准库 HTTP 服务（server.py）
 - **不内置登录**：必须放在你自己的鉴权、SSO、VPN 或 forward-auth 后面，不要直接暴露 `8100` 端口。
 - **仓库不含真实地址**：默认钱包列表为空；请通过页面扫码或自己的 `data/wallets.json` 配置。
 - **二维码只编码地址**：`/api/qr` 只接受合法的 `0x` + 40 位地址；二维码下方同时显示完整地址，扫码后仍需核对。
-- **交易保护**：报价偏离最优池超过 8% 会拦截；高税代币需要额外确认。
-- **本地地址簿**：地址簿只保存在当前浏览器，不上传服务器。
+- **新钱包默认只读**：新添加钱包的 `trade` 为 `false`，需要在钱包管理里确认开启后才能卖出/发送。
+- **后端二次检查**：卖出和发送都会重新检查钱包交易权限、BAW 交易锁，以及 BAW 当前 BSC 地址是否等于看板配置地址。
+- **报价保护**：行情基准缺失、超过 120 秒未更新、交易税未检测、貔貅/高税风险、或报价偏离最优池超过 8% 时，服务端会阻止提交。
+- **提交前重新报价**：服务端在提交前再次调用 BAW 报价；高税（>10%）还会要求 `taxAck`，不能只靠前端弹窗。
+- **任务记录**：任务写入 `data/tasks.json`；幂等键保留 24 小时；服务重启后未完成任务显示为“结果待核实”，不会自动重试。
+- **本地地址簿**：地址簿保存在当前浏览器 `localStorage`；提交转账时会把收款地址发给服务端和 BAW。
+- **日志脱敏**：请求日志不记录请求体/Cookie，并会去掉查询字符串中的地址。
 - **不可撤销**：链上转账和交易不可撤销，提交前请核对地址、网络、代币、数量、滑点和税。
 
 ## 环境要求
@@ -71,6 +86,7 @@ Python 标准库 HTTP 服务（server.py）
 - Binance Agentic Wallet CLI **`baw` 1.12.0**
 - 每个钱包一个 BAW 会话目录，例如 `~/aw/w1`、`~/aw/w2`
 - 可访问 DexScreener、honeypot.is 和 BSC RPC 的网络
+- `baw` 优先从 `BAW_BIN`、再从前台 `PATH` 查找；systemd 部署建议显式设置 `Environment=BAW_BIN=/home/ubuntu/agent/npm-global/bin/baw`
 
 Python 依赖：
 
@@ -105,6 +121,7 @@ python3 server.py
 2. 打开看板 → **钱包管理 → 添加**。
 3. 输入显示名称，用币安 App 扫码。
 4. 服务端会创建新的 `wN` 会话目录，并写入 `data/wallets.json`。
+5. **新钱包默认只读**。需要在钱包管理里点“只读”按钮并确认后，才会开启卖出/发送权限。
 
 也可以直接编辑 `data/wallets.json`：
 
@@ -234,28 +251,38 @@ journalctl -u agentic-wallet -f
 wallet.example.com {
     encode zstd gzip
 
-    # 必须加鉴权：forward_auth / SSO / VPN / basic_auth 任选一种
+    # 必须加鉴权：forward_auth / SSO / VPN / basic_auth 任选一种。
+    # 未设置 ADMIN_PASSWORD_HASH 时 Caddy 会拒绝启动或拒绝访问（fail closed）。
     basic_auth {
-        admin <用 caddy hash-password 生成的密码哈希>
+        admin {$ADMIN_PASSWORD_HASH}
     }
 
     reverse_proxy 127.0.0.1:8100
 }
 ```
 
-生成密码哈希：
+生成密码哈希并写入 Caddy 服务环境：
 
 ```bash
 caddy hash-password
+sudo systemctl edit caddy
 ```
 
-把输出填到 `basic_auth` 里。更推荐把 `basic_auth` 换成你现有的 forward-auth / SSO / VPN。
+在打开的 override 中写入（哈希替换成上一步输出）：
+
+```ini
+[Service]
+Environment=ADMIN_PASSWORD_HASH=<bcrypt-hash>
+```
 
 ```bash
-sudo systemctl reload caddy
+sudo systemctl daemon-reload
+sudo systemctl restart caddy
 ```
 
 访问：`https://wallet.example.com/`
+
+更推荐把 `basic_auth` 换成你现有的 forward-auth / SSO / VPN。`X-Requested-With` 只是浏览器请求限制，**不能替代用户身份认证**。
 
 #### 方案 B：挂到现有网站的 `/agentic/` 路径
 
@@ -268,13 +295,18 @@ example.com {
     redir /agentic /agentic/ 308
 
     handle_path /agentic/* {
-        # 这里也建议复用你原有的 forward_auth / SSO
+        # 复制时必须保留鉴权；没有现成 SSO 时用环境变量 basic_auth。
+        basic_auth {
+            admin {$ADMIN_PASSWORD_HASH}
+        }
         reverse_proxy 127.0.0.1:8100
     }
 }
 ```
 
 访问：`https://example.com/agentic/`
+
+如果没有设置 `ADMIN_PASSWORD_HASH`，或者你已有 forward-auth / SSO，请替换这一段；不要让 `handle_path` 直接裸奔到后端。
 
 注意：
 
@@ -330,14 +362,14 @@ sudo systemctl restart agentic-wallet
 
 ```caddyfile
 wallet.example.com {
-    redir /agentic /agentic/ 308
-    handle_path /agentic/* {
-        reverse_proxy 127.0.0.1:8100
+    basic_auth {
+        admin {$ADMIN_PASSWORD_HASH}
     }
+    reverse_proxy 127.0.0.1:8100
 }
 ```
 
-生产环境请加 forward-auth、SSO、VPN 或等效鉴权。更多示例见 `deploy/Caddyfile.example`。
+未设置 `ADMIN_PASSWORD_HASH` 时请视为不可用配置。生产环境请换成 forward-auth、SSO、VPN 或等效鉴权。更多示例见 `deploy/Caddyfile.example`。
 
 ### systemd
 
@@ -359,6 +391,7 @@ data/
 ├── keepalive.json
 ├── history/              # 每个钱包的交易记录缓存
 ├── audit.jsonl           # 本地交易审计
+├── tasks.json            # 持久化任务 + 幂等记录
 ├── balance-cache.json    # 短期余额快照
 └── market-cache.json     # 短期价格快照
 ```
@@ -389,11 +422,21 @@ data/
 
 - 价格参考：DexScreener 最深流动性池。
 - 卖出：BAW `market-order swap`；发送：BAW `wallet send`。
-- 报价偏离最优池低于 **-8%**：拦截。
-- 偏离在 **-3% 到 -8%**：提示。
-- 卖出税 **> 10%**：卖出前额外确认。
-- 貔貅 / 卖出税 **> 50%**：默认隐藏。
+- 行情基准缺失、池子无流动性、或超过 **120 秒**未更新：阻止提交。
+- 交易税未完成检测、风险检测中、貔貅/高税：阻止提交。
+- 报价偏离最优池低于 **-8%**：拦截；**-3% 到 -8%**：提示。
+- 卖出税 **> 10%**：前端确认 + 服务端要求 `taxAck` 才提交。
+- 卖出前服务端会重新报价；BAW 当前只暴露 `--slippage`，没有独立的 min-receive 参数，最终成交以 BAW 报价和滑点为准。
+- 任务按幂等键持久化；轮询超时或服务重启后显示“结果待核实”，不要盲目重复提交。
 - 保活只执行 `wallet status`，不会自动买卖或转账。
+
+## 测试
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+测试覆盖数量格式化（整数尾零）、非法数量、税率清洗、缺失行情基准拦截、只读钱包发送拦截、任务持久化和幂等。测试不调用真实钱包或交易接口。
 
 ## 免责声明
 
@@ -461,8 +504,23 @@ Python stdlib HTTP server (server.py)
 - **No built-in authentication.** Run it behind your own SSO, forward-auth, VPN, or equivalent. Never expose port 8100 directly.
 - **No real wallet addresses in this repository.** `DEFAULT_WALLETS` is empty; configure via the QR flow or `data/wallets.json`.
 - **Exact-address QR.** `/api/qr` accepts only a valid `0x` + 40-hex address and displays the full address below the QR.
-- **Trade guard.** Sells below the -8% best-pool threshold are blocked; high-tax sells require an extra confirmation.
-- **Local address book.** Saved addresses stay in browser `localStorage`.
+- **New wallets are read-only.** New wallets start with `trade: false`; enable trading explicitly in wallet management.
+- **Backend checks.** Sell and send both re-check trade permission, the BAW transaction lock, and that the BAW BSC address matches the configured address.
+- **Quote guard.** Missing/stale market data (>120s), unknown tax, honeypot/high-tax risk, or a quote more than 8% below the best pool blocks submission.
+- **Re-quote + tax ack.** The server re-quotes immediately before submission; sell tax above 10% requires a backend `taxAck`, not just a browser dialog.
+- **Persistent tasks.** Tasks are stored in `data/tasks.json`; idempotency keys last 24h; unfinished tasks become “result unknown” after a restart instead of retrying.
+- **Local address book.** Saved addresses stay in browser `localStorage`; a transfer submits the recipient to this server and BAW.
+- **Redacted logs.** No bodies/cookies are logged; query strings containing addresses are redacted.
+
+### Data flow
+
+- **Browser**: full wallet addresses, balances, history, QR images, and task states; the local address book uses `localStorage`.
+- **This service**: wallet config, BAW session paths, caches, task records, audit log. No private keys or seed phrases.
+- **BAW / Binance**: login, balances, quotes, sends, trades; receives the session and trade parameters it needs.
+- **DexScreener / honeypot.is / BSC RPC**: token/pool addresses and chain reads.
+- **Server logs**: request line and status only; no bodies or cookies. Query strings containing addresses are redacted as `?[redacted]`.
+
+Address-book recipients are sent to this server when submitting a transfer, then to BAW. Pairing URLs/codes are sensitive while valid; do not share screenshots. Restrict log access and prune old `data/` task/history files periodically.
 
 ## Requirements
 
@@ -471,6 +529,7 @@ Python stdlib HTTP server (server.py)
 - Binance Agentic Wallet CLI `baw` 1.12.0
 - One BAW session directory per wallet, e.g. `~/aw/w1`
 - Outbound access to DexScreener, honeypot.is, and BSC RPC
+- `baw` is resolved from `BAW_BIN`, then `PATH`, then the local install path. For systemd, set `Environment=BAW_BIN=/home/ubuntu/agent/npm-global/bin/baw` explicitly.
 
 ## Quick start
 
@@ -499,6 +558,7 @@ Open `http://127.0.0.1:8100/` locally, or put it behind an authenticated reverse
 2. Open the dashboard → **Wallet management → Add**.
 3. Enter a display name and scan the Binance App QR.
 4. The server creates a new `wN` session directory and updates `data/wallets.json`.
+5. **New wallets are read-only by default.** Confirm the “只读” toggle in wallet management before enabling sells/sends.
 
 Wallets can also be configured directly:
 
@@ -609,9 +669,10 @@ The app has **no built-in login**. Add authentication in front of it.
 wallet.example.com {
     encode zstd gzip
 
-    # Replace with forward-auth / SSO / VPN or basic_auth.
+    # Replace with forward-auth / SSO / VPN if available.
+    # Fail closed when ADMIN_PASSWORD_HASH is not configured.
     basic_auth {
-        admin <hash generated by caddy hash-password>
+        admin {$ADMIN_PASSWORD_HASH}
     }
 
     reverse_proxy 127.0.0.1:8100
@@ -620,10 +681,22 @@ wallet.example.com {
 
 ```bash
 caddy hash-password
-sudo systemctl reload caddy
+sudo systemctl edit caddy
+```
+
+```ini
+[Service]
+Environment=ADMIN_PASSWORD_HASH=<bcrypt-hash>
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart caddy
 ```
 
 Open `https://wallet.example.com/`.
+
+`X-Requested-With` is only a browser-request guard; it is not authentication.
 
 #### Option B: existing website at `/agentic/`
 
@@ -634,13 +707,18 @@ example.com {
     redir /agentic /agentic/ 308
 
     handle_path /agentic/* {
-        # Reuse your existing forward_auth / SSO here.
+        # Keep authentication here. Replace with forward_auth / SSO if available.
+        basic_auth {
+            admin {$ADMIN_PASSWORD_HASH}
+        }
         reverse_proxy 127.0.0.1:8100
     }
 }
 ```
 
 Open `https://example.com/agentic/`.
+
+Do not leave `handle_path` unauthenticated. If `ADMIN_PASSWORD_HASH` is unset, treat the config as unusable and fix auth before exposing it.
 
 Requirements: keep the trailing slash; let `handle_path` strip `/agentic` so the backend receives `/api/*`; do not proxy `/agentic` unchanged or the API will 404.
 
@@ -691,14 +769,14 @@ Minimal Caddy example:
 
 ```caddyfile
 wallet.example.com {
-    redir /agentic /agentic/ 308
-    handle_path /agentic/* {
-        reverse_proxy 127.0.0.1:8100
+    basic_auth {
+        admin {$ADMIN_PASSWORD_HASH}
     }
+    reverse_proxy 127.0.0.1:8100
 }
 ```
 
-Add forward-auth / SSO / VPN in production. See `deploy/Caddyfile.example`.
+This sample fails closed when `ADMIN_PASSWORD_HASH` is unset. Replace with forward-auth / SSO / VPN in production. See `deploy/Caddyfile.example`.
 
 ### systemd
 
@@ -734,11 +812,21 @@ Mutating requests require `X-Requested-With: agentic` and JSON bodies.
 
 - Price reference: DexScreener deepest-liquidity pool.
 - Sells use BAW `market-order swap`; sends use `wallet send`.
-- Quote below **-8%** vs. best pool: blocked.
-- **-3% to -8%**: warning.
-- Sell tax **> 10%**: extra confirmation.
-- Honeypot / sell tax **> 50%**: hidden by default.
+- Missing/stale baseline (>120s) or no pool liquidity: blocked.
+- Unknown tax, pending risk check, honeypot/high-tax: blocked.
+- Quote below **-8%** vs. best pool: blocked; **-3% to -8%**: warning.
+- Sell tax **> 10%**: browser confirmation plus backend `taxAck`.
+- The server re-quotes immediately before submission. BAW currently exposes only `--slippage`, not an explicit min-receive field; final execution follows BAW's quote and slippage.
+- Tasks are persisted by idempotency key; after polling timeout or restart, verify by task ID / transaction hash instead of blindly retrying.
 - Keepalive only runs `wallet status`; it never trades or transfers.
+
+## Tests
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+Coverage includes integer amount formatting, invalid amounts, tax sanitization, missing-market blocking, read-only send blocking, task persistence, and idempotency. Tests never call a real wallet or trading endpoint.
 
 ## Disclaimer
 

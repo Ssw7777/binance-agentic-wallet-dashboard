@@ -7,10 +7,13 @@ stored or returned here.
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import json
+import math
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -27,12 +30,14 @@ ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
 DATA.mkdir(exist_ok=True)
 HOME = Path(os.path.expanduser("~"))
-BAW = str(HOME / "agent" / "npm-global" / "bin" / "baw")
+BAW = os.environ.get("BAW_BIN") or shutil.which("baw") or str(HOME / "agent" / "npm-global" / "bin" / "baw")
 PATH = f"{HOME}/agent/node/bin:{HOME}/agent/npm-global/bin:" + os.environ.get("PATH", "")
 PORT = 8100
 CHAIN = "56"
 NATIVE = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 USDT = "0x55d398326f99059ff775485246999027b3197955"
+USDC = "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d"
+MARKET_STALE_SECONDS = 120
 WBNB = "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c"
 BSC_RPCS = [
     "https://bsc-dataseed.binance.org/",
@@ -48,6 +53,7 @@ COLORS = ["#d4654a", "#4f6f9f", "#7c6a9f", "#2f8f7a", "#b07a12", "#a35476", "#3f
 WALLETS: list[dict[str, Any]] = []
 WALLET_BY_ID: dict[str, dict[str, Any]] = {}
 CONFIG_PATH = DATA / "wallets.json"
+TASKS_PATH = DATA / "tasks.json"
 _config_lock = threading.RLock()
 _next_slot = 7
 
@@ -156,6 +162,26 @@ def wallet_address(slot: str) -> str:
         if str(item.get("binanceChainId")) == CHAIN:
             return str(item.get("address") or "")
     return ""
+
+
+def wallet_ready_error(wallet: str, check_lock: bool = True) -> str | None:
+    """Backend-side permission/session checks shared by sell and send."""
+    w = WALLET_BY_ID.get(wallet)
+    if not w:
+        return "wallet not found"
+    if not w.get("trade"):
+        return "该钱包未开启交易权限（只读）"
+    expected = str(w.get("address") or "")
+    actual = wallet_address(wallet)
+    if not actual:
+        return "无法读取当前 BAW 会话地址，请检查会话"
+    if expected and actual.lower() != expected.lower():
+        return "BAW 会话地址与看板配置不一致，已阻止操作"
+    if check_lock:
+        lock = baw(wallet, ["wallet", "tx-lock", "--binanceChainId", CHAIN, "--json"], timeout=30)
+        if lock.get("success") and str((lock.get("data") or {}).get("status") or "").upper() == "LOCKED":
+            return "交易锁已开启，请先在币安 App 解锁"
+    return None
 
 
 def short_addr(a: str | None) -> str:
@@ -272,7 +298,7 @@ def load_balance_cache() -> None:
     try:
         data = json.loads(BALANCE_PATH.read_text(encoding="utf-8"))
         if isinstance(data, dict) and isinstance(data.get("wallets"), dict):
-            data["ts"] = time.time() - 5
+            data["ts"] = float(data.get("ts") or 0)
             _balance_cache = data
     except Exception:
         pass
@@ -292,8 +318,10 @@ def load_market_cache() -> None:
     try:
         data = json.loads(MARKET_PATH.read_text(encoding="utf-8"))
         if isinstance(data, dict) and isinstance(data.get("data"), dict):
+            # Preserve the real age. The UI may paint a stale snapshot, but the
+            # sell path refuses to submit until a fresh baseline exists.
             _market_cache = data
-            _market_cache["ts"] = time.time() - 5
+            _market_cache["ts"] = float(data.get("ts") or 0)
     except Exception:
         pass
 
@@ -405,12 +433,14 @@ def dex_snapshot(addresses: list[str]) -> dict[str, dict[str, Any]]:
                 "change24": float((best.get("priceChange") or {}).get("h24") or 0),
                 "url": str(best.get("url") or ""),
                 "pairCount": len(pairs),
+                "ts": now,
             }
     with _cache_lock:
         merged = dict(_market_cache["data"])
         merged.update(out)
         _market_cache["data"] = merged
-        _market_cache["ts"] = now
+        if out:
+            _market_cache["ts"] = now
         save_market_cache(_market_cache)
         return merged
 
@@ -421,7 +451,7 @@ def address_for_market(addr: str) -> str:
 
 def ensure_audit(addr: str, meta: dict[str, Any]) -> None:
     addr = addr.lower()
-    if addr in (NATIVE, USDT, WBNB) or addr.startswith("0x8ac76a51"):
+    if addr in (NATIVE, USDT, WBNB, USDC):
         return
     now = time.time()
     with _cache_lock:
@@ -469,7 +499,7 @@ def ensure_audits(tokens: dict[str, dict[str, Any]], markets: dict[str, dict[str
 
 def token_risk(addr: str, meta: dict[str, Any], value: float) -> dict[str, Any]:
     addr = addr.lower()
-    if addr in (NATIVE, USDT) or addr.startswith("0x8ac76a51"):
+    if addr in (NATIVE, USDT, USDC):
         return {"level": "safe", "label": "主流", "hidden": False}
     m = meta
     if not m or not m.get("price"):
@@ -491,13 +521,23 @@ def token_risk(addr: str, meta: dict[str, Any], value: float) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------- portfolio
+def _tax_number(value: Any) -> float | None:
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(n) or n < 0 or n > 100:
+        return None
+    return round(n, 4)
+
+
 def token_tax(addr: str) -> dict[str, Any]:
     addr = addr.lower()
-    if addr in (NATIVE, USDT) or addr.startswith("0x8ac76a51"):
+    if addr in (NATIVE, USDT, USDC, WBNB):
         return {"buy": 0, "sell": 0}
     with _cache_lock:
         audit = _audit_cache.get(addr) or {}
-    return {"buy": audit.get("buyTax"), "sell": audit.get("sellTax")}
+    return {"buy": _tax_number(audit.get("buyTax")), "sell": _tax_number(audit.get("sellTax"))}
 
 
 def build_portfolio(wallet_filter: str = "all") -> dict[str, Any]:
@@ -586,6 +626,8 @@ def build_portfolio(wallet_filter: str = "all") -> dict[str, Any]:
             "native": native,
             "price": price,
             "priceSource": "DEX" if m.get("price") else "N/A",
+            "marketAge": round(time.time() - float(m.get("ts") or _market_cache.get("ts") or 0), 1) if m else None,
+            "marketStale": bool(not m or (time.time() - float(m.get("ts") or _market_cache.get("ts") or 0)) > MARKET_STALE_SECONDS),
             "change24": float(m.get("change24") or 0),
             "liquidity": float(m.get("liquidity") or 0),
             "dex": m.get("dex") or "",
@@ -611,7 +653,8 @@ def build_portfolio(wallet_filter: str = "all") -> dict[str, Any]:
         "wallets": wallets,
         "tokens": out_tokens,
         "selectedWallet": wallet_filter,
-        "totalUsd": round(total, 2),
+        "totalUsd": round(visible, 2),
+        "totalAllUsd": round(total, 2),
         "visibleUsd": round(visible, 2),
         "hiddenUsd": round(total - visible, 2),
         "hiddenCount": len(hidden),
@@ -785,16 +828,40 @@ def quote_for(wallet: str, token: str, qty: str, slippage: str | float = "auto")
     m = token_market(token)
     token_price = float(m.get("price") or 0)
     target_price = 1.0 if target == USDT else float(token_market(NATIVE).get("price") or 0)
+    market_ts = float(m.get("ts") or _market_cache.get("ts") or 0)
+    market_age = time.time() - market_ts if market_ts else 1e9
+    tax = token_tax(token)
+    with _cache_lock:
+        audit = _audit_cache.get(token.lower()) or {}
+    major = token in (NATIVE, USDT, USDC, WBNB)
+    blocked_reason = None
+    if not m or token_price <= 0 or float(m.get("liquidity") or 0) <= 0:
+        blocked_reason = "行情基准缺失，禁止提交；请稍后刷新行情"
+    elif target_price <= 0:
+        blocked_reason = "目标资产价格基准缺失，禁止提交"
+    elif market_age > MARKET_STALE_SECONDS:
+        blocked_reason = f"行情基准已过期（{int(market_age)} 秒），禁止提交"
+    elif not major and (tax.get("buy") is None or tax.get("sell") is None):
+        blocked_reason = "交易税尚未完成检测，禁止提交"
+    elif not major and audit.get("pending"):
+        blocked_reason = "风险检测进行中，禁止提交"
+    elif not major and audit.get("hidden"):
+        blocked_reason = "该代币被风险策略标记为貔貅/高税，禁止提交"
+
     expected_usd = float(from_amount) * token_price
     actual_usd = float(to_amount) * target_price
+    if blocked_reason is None and expected_usd <= 0:
+        blocked_reason = "无法计算预期价值，禁止提交"
     deviation = ((actual_usd - expected_usd) / expected_usd * 100) if expected_usd > 0 else 0.0
-    guard = "ok"
-    if expected_usd > 0 and deviation < -8:
-        guard = "blocked"
-    elif expected_usd > 0 and deviation < -3:
-        guard = "warn"
+    guard = "blocked" if blocked_reason else "ok"
+    if not blocked_reason:
+        if deviation < -8:
+            guard = "blocked"
+        elif deviation < -3:
+            guard = "warn"
     return {
-        "ok": True,
+        "ok": blocked_reason is None,
+        "error": blocked_reason,
         "wallet": wallet,
         "token": token,
         "target": target,
@@ -809,7 +876,10 @@ def quote_for(wallet: str, token: str, qty: str, slippage: str | float = "auto")
         "expectedUsd": round(expected_usd, 4),
         "deviationPct": round(deviation, 3),
         "guard": guard,
-        "tax": token_tax(token),
+        "baseline": "missing" if blocked_reason and ("基准" in blocked_reason or "过期" in blocked_reason) else "ok",
+        "marketAgeSec": round(market_age, 1) if market_age < 1e8 else None,
+        "tax": tax,
+        "needsTaxAck": bool(tax.get("sell") is not None and tax["sell"] > 10),
         "pool": {
             "dex": m.get("dex"),
             "labels": m.get("labels"),
@@ -846,20 +916,79 @@ def qty_for_pct(wallet: str, token: str, pct: float) -> tuple[Decimal, str | Non
     return amount, None
 
 
+def parse_positive_amount(raw: Any) -> Decimal:
+    try:
+        d = Decimal(str(raw))
+    except Exception as exc:
+        raise ValueError("invalid amount") from exc
+    if not d.is_finite() or d <= 0:
+        raise ValueError("invalid amount")
+    return d
+
+
 def fmt_qty(d: Decimal, token: str) -> str:
+    """Format a token quantity without ever trimming integer zeros.
+
+    Only the fractional part may be stripped.  Examples:
+    10 -> "10", 100.0 -> "100", 120 -> "120", 0.5000 -> "0.5".
+    """
+    if not d.is_finite() or d < 0:
+        raise ValueError("invalid quantity")
     if token == NATIVE:
-        s = format(d.quantize(Decimal("0.000000000000000001"), rounding=ROUND_DOWN), "f")
-    else:
-        s = format(d, "f").rstrip("0").rstrip(".") or "0"
-    return s
+        d = d.quantize(Decimal("0.000000000000000001"), rounding=ROUND_DOWN)
+    s = format(d, "f")
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s or "0"
 
 
-def new_task(kind: str, legs: list[dict[str, Any]], idem: str | None) -> dict[str, Any]:
+def save_tasks() -> None:
+    try:
+        with _task_lock:
+            data = {"tasks": list(_tasks.values())}
+        tmp = TASKS_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, default=str), encoding="utf-8")
+        tmp.replace(TASKS_PATH)
+    except Exception:
+        pass
+
+
+def load_tasks() -> None:
+    global _tasks
+    try:
+        data = json.loads(TASKS_PATH.read_text(encoding="utf-8"))
+        tasks = data.get("tasks") if isinstance(data, dict) else None
+        if not isinstance(tasks, list):
+            return
+        loaded: dict[str, dict[str, Any]] = {}
+        for task in tasks:
+            if not isinstance(task, dict) or not task.get("id"):
+                continue
+            if task.get("status") in ("queued", "running"):
+                task["status"] = "unknown"
+                task["error"] = "服务重启，提交结果待核实；请用交易哈希或钱包记录核对"
+                task["finishedAt"] = now_iso()
+            loaded[str(task["id"])] = task
+        _tasks = loaded
+    except Exception:
+        pass
+
+
+def new_task(kind: str, legs: list[dict[str, Any]], idem: str | None, fingerprint: str | None = None) -> dict[str, Any]:
     with _task_lock:
         if idem:
             for t in _tasks.values():
-                if t.get("idempotencyKey") == idem and time.time() - float(t.get("createdTs", 0)) < 60:
+                if t.get("idempotencyKey") == idem and time.time() - float(t.get("createdTs", 0)) < 86400:
+                    if fingerprint and t.get("fingerprint") not in (None, fingerprint):
+                        raise ValueError("idempotency key reused with different operation")
                     return t
+        if len(_tasks) > 300:
+            terminal = sorted(
+                ((tid, t) for tid, t in _tasks.items() if t.get("status") in ("submitted", "partial", "failed", "unknown")),
+                key=lambda item: float(item[1].get("createdTs") or 0),
+            )
+            for tid, _ in terminal[:max(0, len(_tasks) - 250)]:
+                _tasks.pop(tid, None)
         task_id = f"t{int(time.time() * 1000)}{os.urandom(2).hex()}"
         task = {
             "id": task_id,
@@ -869,9 +998,21 @@ def new_task(kind: str, legs: list[dict[str, Any]], idem: str | None) -> dict[st
             "createdTs": time.time(),
             "legs": legs,
             "idempotencyKey": idem,
+            "fingerprint": fingerprint,
         }
         _tasks[task_id] = task
+    save_tasks()
     return task
+
+
+def claim_task(task: dict[str, Any]) -> bool:
+    with _task_lock:
+        if task.get("started") or task.get("status") != "queued":
+            return False
+        task["started"] = True
+        task["startedAt"] = now_iso()
+    save_tasks()
+    return True
 
 
 def invalidate_history(wallet: str) -> None:
@@ -888,7 +1029,7 @@ def add_audit(entry: dict[str, Any]) -> None:
         pass
 
 
-def run_sell_task(task: dict[str, Any], token: str, pct: float, slippage: float, amount: str | None = None) -> None:
+def run_sell_task(task: dict[str, Any], token: str, pct: float, slippage: float, amount: str | None = None, tax_ack: bool = False) -> None:
     token = token.lower()
     target = target_for(token)
     task["status"] = "running"
@@ -896,7 +1037,7 @@ def run_sell_task(task: dict[str, Any], token: str, pct: float, slippage: float,
         with ThreadPoolExecutor(max_workers=min(3, len(task["legs"]))) as ex:
             futures = {}
             for leg in task["legs"]:
-                futures[ex.submit(sell_leg, leg, token, target, pct, slippage)] = leg
+                futures[ex.submit(sell_leg, leg, token, target, pct, slippage, tax_ack)] = leg
             for f in as_completed(futures):
                 leg = futures[f]
                 try:
@@ -917,17 +1058,20 @@ def run_sell_task(task: dict[str, Any], token: str, pct: float, slippage: float,
         for leg in task["legs"]:
             invalidate_history(leg["wallet"])
         add_audit({"task": task["id"], "kind": "sell", "token": token, "pct": pct, "amount": amount, "legs": task["legs"]})
+        save_tasks()
     except Exception:  # noqa: BLE001
         task["status"] = "failed"
         task["error"] = traceback.format_exc()[-800:]
         task["finishedAt"] = now_iso()
+        save_tasks()
 
 
-def sell_leg(leg: dict[str, Any], token: str, target: str, pct: float, slippage: float) -> None:
+def sell_leg(leg: dict[str, Any], token: str, target: str, pct: float, slippage: float, tax_ack: bool = False) -> None:
     wid = leg["wallet"]
     leg["status"] = "checking"
-    if not WALLET_BY_ID[wid].get("trade"):
-        leg.update(status="failed", error="该钱包交易权限已关闭")
+    ready_err = wallet_ready_error(wid)
+    if ready_err:
+        leg.update(status="failed", error=ready_err)
         return
     with _wallet_locks[wid]:
         if leg.get("fixedQty"):
@@ -946,10 +1090,6 @@ def sell_leg(leg: dict[str, Any], token: str, target: str, pct: float, slippage:
                 return
         q = fmt_qty(qty, token)
         leg["qty"] = q
-        lock = baw(wid, ["wallet", "tx-lock", "--binanceChainId", CHAIN, "--json"], timeout=30)
-        if lock.get("success") and str((lock.get("data") or {}).get("status") or "").upper() == "LOCKED":
-            leg.update(status="failed", error="交易锁已开启，请先在币安 App 解锁")
-            return
         leg["status"] = "quoting"
         pre = quote_for(wid, token, q, slippage)
         if not pre.get("ok"):
@@ -959,6 +1099,10 @@ def sell_leg(leg: dict[str, Any], token: str, target: str, pct: float, slippage:
         leg["quote"] = {k: pre.get(k) for k in ("toAmount", "toSymbol", "deviationPct", "guard", "slippagePct", "pool")}
         if pre.get("guard") == "blocked":
             leg.update(status="failed", error=f"报价偏离最优池 {pre.get('deviationPct')}% ，已拦截（保护）")
+            return
+        sell_tax = (pre.get("tax") or {}).get("sell")
+        if sell_tax is not None and sell_tax > 10 and not tax_ack:
+            leg.update(status="failed", error=f"卖出税 {sell_tax}%，需要额外确认")
             return
         leg["status"] = "submitting"
         r = baw(wid, [
@@ -1006,15 +1150,21 @@ def run_send_task(task: dict[str, Any], token: str, pct: float, recipient: str, 
         for leg in task["legs"]:
             invalidate_history(leg["wallet"])
         add_audit({"task": task["id"], "kind": "send", "token": token, "pct": pct, "amount": amount, "to": recipient, "legs": task["legs"]})
+        save_tasks()
     except Exception:  # noqa: BLE001
         task["status"] = "failed"
         task["error"] = traceback.format_exc()[-800:]
         task["finishedAt"] = now_iso()
+        save_tasks()
 
 
 def send_leg(leg: dict[str, Any], token: str, pct: float, recipient: str, amount: str | None = None) -> None:
     wid = leg["wallet"]
     leg["status"] = "checking"
+    ready_err = wallet_ready_error(wid)
+    if ready_err:
+        leg.update(status="failed", error=ready_err)
+        return
     with _wallet_locks[wid]:
         if amount is not None:
             try:
@@ -1050,19 +1200,19 @@ def send_leg(leg: dict[str, Any], token: str, pct: float, recipient: str, amount
 
 def start_sell(payload: dict[str, Any]) -> dict[str, Any]:
     token = str(payload.get("token") or "").lower()
-    wallet_ids = [str(x) for x in (payload.get("walletIds") or []) if str(x) in WALLET_BY_ID]
+    wallet_ids = list(dict.fromkeys(str(x) for x in (payload.get("walletIds") or []) if str(x) in WALLET_BY_ID))
     amount_raw = payload.get("amount")
     amount: str | None = None
     if amount_raw not in (None, ""):
-        try:
-            amount_dec = Decimal(str(amount_raw))
-        except Exception as exc:
-            raise ValueError("invalid amount") from exc
-        if amount_dec <= 0:
-            raise ValueError("invalid amount")
-        amount = str(amount_raw)
-    pct = float(payload.get("pct") or 0)
-    slippage = float(payload.get("slippage") or 1)
+        amount_dec = parse_positive_amount(amount_raw)
+        amount = format(amount_dec, "f")
+    try:
+        pct = float(payload.get("pct") or 0)
+        slippage = float(payload.get("slippage") or 1)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid pct/slippage") from exc
+    if not math.isfinite(pct) or not math.isfinite(slippage):
+        raise ValueError("invalid pct/slippage")
     if not token or not wallet_ids:
         raise ValueError("token and walletIds required")
     if amount is None and not (0 < pct <= 100):
@@ -1070,6 +1220,11 @@ def start_sell(payload: dict[str, Any]) -> dict[str, Any]:
     if not (0.05 <= slippage <= 50):
         raise ValueError("invalid slippage")
     idem = str(payload.get("idempotencyKey") or "") or None
+    tax_ack = payload.get("taxAck") is True
+    fingerprint = hashlib.sha256(json.dumps({
+        "kind": "sell", "token": token, "wallets": wallet_ids,
+        "amount": amount, "pct": pct, "slippage": slippage, "taxAck": tax_ack,
+    }, sort_keys=True).encode()).hexdigest()
     if amount is not None:
         balances: list[tuple[str, Decimal]] = []
         total_qty = Decimal(0)
@@ -1095,39 +1250,41 @@ def start_sell(payload: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("no sellable amount")
     else:
         legs = [{"wallet": w, "status": "queued"} for w in wallet_ids]
-    task = new_task("sell", legs, idem)
-    if task.get("status") != "queued" or task.get("started"):
+    task = new_task("sell", legs, idem, fingerprint)
+    if not claim_task(task):
         return task
-    task["started"] = True
-    threading.Thread(target=run_sell_task, args=(task, token, pct, slippage, amount), daemon=True).start()
+    threading.Thread(target=run_sell_task, args=(task, token, pct, slippage, amount, tax_ack), daemon=True).start()
     return task
 
 
 def start_send(payload: dict[str, Any]) -> dict[str, Any]:
     token = str(payload.get("token") or "").lower()
-    wallet_ids = [str(x) for x in (payload.get("walletIds") or []) if str(x) in WALLET_BY_ID]
+    wallet_ids = list(dict.fromkeys(str(x) for x in (payload.get("walletIds") or []) if str(x) in WALLET_BY_ID))
     amount_raw = payload.get("amount")
     amount: str | None = None
     if amount_raw not in (None, ""):
-        try:
-            amount_dec = Decimal(str(amount_raw))
-        except Exception as exc:
-            raise ValueError("invalid amount") from exc
-        if amount_dec <= 0:
-            raise ValueError("invalid amount")
-        amount = str(amount_raw)
-    pct = float(payload.get("pct") or 100)
+        amount_dec = parse_positive_amount(amount_raw)
+        amount = format(amount_dec, "f")
+    try:
+        pct = float(payload.get("pct") or 100)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid pct") from exc
+    if not math.isfinite(pct):
+        raise ValueError("invalid pct")
     recipient = str(payload.get("recipient") or "").strip()
     if not token or not wallet_ids or not re.fullmatch(r"0x[a-fA-F0-9]{40}", recipient):
         raise ValueError("invalid token/wallet/recipient")
     if amount is None and not (0 < pct <= 100):
         raise ValueError("invalid pct")
     idem = str(payload.get("idempotencyKey") or "") or None
+    fingerprint = hashlib.sha256(json.dumps({
+        "kind": "send", "token": token, "wallets": wallet_ids,
+        "amount": amount, "pct": pct, "recipient": recipient.lower(),
+    }, sort_keys=True).encode()).hexdigest()
     legs = [{"wallet": w, "status": "queued"} for w in wallet_ids]
-    task = new_task("send", legs, idem)
-    if task.get("status") != "queued" or task.get("started"):
+    task = new_task("send", legs, idem, fingerprint)
+    if not claim_task(task):
         return task
-    task["started"] = True
     threading.Thread(target=run_send_task, args=(task, token, pct, recipient, amount), daemon=True).start()
     return task
 
@@ -1136,6 +1293,14 @@ def start_send(payload: dict[str, Any]) -> dict[str, Any]:
 def start_wallet_add(payload: dict[str, Any]) -> dict[str, Any]:
     global _next_slot
     label = str(payload.get("label") or "").strip()[:30]
+    now_ms = int(time.time() * 1000)
+    for pending_slot, pending in list(_pending_wallets.items()):
+        if int(pending.get("expireAt") or 0) and int(pending["expireAt"]) < now_ms - 3_600_000:
+            _pending_wallets.pop(pending_slot, None)
+    if len(_pending_wallets) > 12:
+        oldest = sorted(_pending_wallets.items(), key=lambda item: float(item[1].get("expireAt") or 0))[:len(_pending_wallets) - 12]
+        for pending_slot, _ in oldest:
+            _pending_wallets.pop(pending_slot, None)
     with _config_lock:
         slot = f"w{_next_slot}"
         _next_slot += 1
@@ -1204,7 +1369,7 @@ def _verify_wallet(slot: str, qr_id: str) -> None:
             "agent": label,
             "address": addr,
             "color": COLORS[len(WALLETS) % len(COLORS)],
-            "trade": True,
+            "trade": False,
         }])
         save_wallet_config()
     pending["status"] = "added"
@@ -1224,6 +1389,16 @@ def pending_wallet(slot: str) -> dict[str, Any]:
     if not p:
         return {"status": "missing"}
     return {k: v for k, v in p.items() if k != "qrCodeId"}
+
+
+def set_wallet_trade(wallet_id: str, trade: bool) -> dict[str, Any]:
+    with _config_lock:
+        w = WALLET_BY_ID.get(wallet_id)
+        if not w:
+            return {"ok": False, "error": "wallet not found"}
+        w["trade"] = bool(trade)
+        save_wallet_config()
+    return {"ok": True, "wallet": dict(w)}
 
 
 def rename_wallet(wallet_id: str, label: str) -> dict[str, Any]:
@@ -1328,8 +1503,10 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "0xStudyAgentic/1.0"
 
     def log_message(self, fmt: str, *args: Any) -> None:
-        # Keep journald small; no request body, cookie, or token.
-        print("%s - %s" % (self.address_string(), fmt % args))
+        # Keep journald small; redact query strings (QR/addresses) and never log bodies/cookies.
+        msg = fmt % args
+        msg = re.sub(r'(/[^\s"?]+)\?[^\s"]+', r"\1?[redacted]", msg)
+        print("%s - %s" % (self.address_string(), msg))
 
     def _json(self, data: Any, status: int = 200) -> None:
         body = json.dumps(data, ensure_ascii=False, default=str).encode()
@@ -1443,19 +1620,22 @@ class Handler(BaseHTTPRequestHandler):
             if path.startswith("/api/wallets/") and path.endswith("/rename"):
                 wallet_id = path[len("/api/wallets/"):-len("/rename")].strip("/")
                 return self._json(rename_wallet(wallet_id, str(payload.get("label") or "")))
+            if path.startswith("/api/wallets/") and path.endswith("/trade"):
+                wallet_id = path[len("/api/wallets/"):-len("/trade")].strip("/")
+                return self._json(set_wallet_trade(wallet_id, payload.get("trade") is True))
             if path == "/api/quote":
                 wallet = str(payload.get("wallet") or "w1")
                 token = str(payload.get("token") or "").lower()
-                pct = float(payload.get("pct") or 50)
+                try:
+                    pct = float(payload.get("pct") or 50)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("invalid pct") from exc
+                if not math.isfinite(pct) or not (0 < pct <= 100):
+                    raise ValueError("invalid pct")
                 if wallet not in WALLET_BY_ID or not token:
                     raise ValueError("invalid wallet/token")
                 if payload.get("qty") not in (None, ""):
-                    try:
-                        qty = Decimal(str(payload.get("qty")))
-                    except Exception as exc:
-                        raise ValueError("invalid qty") from exc
-                    if qty <= 0:
-                        raise ValueError("invalid qty")
+                    qty = parse_positive_amount(payload.get("qty"))
                 else:
                     qty, err = qty_for_pct(wallet, token, pct)
                     if err:
@@ -1496,6 +1676,7 @@ def main() -> None:
     load_balance_cache()
     load_market_cache()
     load_keepalive()
+    load_tasks()
     # Warm caches in the background; first page request does not wait for audits.
     threading.Thread(target=data_loop, daemon=True).start()
     threading.Thread(target=history_loop, daemon=True).start()

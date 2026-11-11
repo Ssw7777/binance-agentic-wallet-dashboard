@@ -1528,3 +1528,15 @@ body{font-size:18px}
   .price::before,.balance::before,.value::before,.liq::before,.tax-cell::before{font-family:var(--font);font-size:9px;font-weight:600;line-height:1.2;color:var(--ink-3)}
   .price::before{content:"价格"}.balance::before{content:"余额"}.value::before{content:"价值"}.liq::before{content:"流动性"}.tax-cell::before{content:"交易税"}
 }
+/* audit fixes: trade authorization, stale data, full send address */
+.live-dot.stale{background:var(--amber);box-shadow:0 0 0 3px var(--amber-soft)}
+#dataFreshness{font-variant-numeric:tabular-nums}
+.trade-toggle{height:18px;padding:0 5px;border-radius:4px;font-size:9px;font-weight:750;line-height:1;border:1px solid var(--line);background:var(--card);color:var(--ink-3);flex:none}
+.trade-toggle.on{color:var(--green);border-color:color-mix(in srgb,var(--green) 35%,var(--line));background:var(--green-soft)}
+.trade-toggle.off{color:var(--amber);border-color:color-mix(in srgb,var(--amber) 35%,var(--line));background:var(--amber-soft)}
+.trade-toggle:hover{border-color:var(--accent);color:var(--accent)}
+.send-full-address{word-break:break-all;font-family:Geist,monospace;font-size:11px;line-height:1.45;text-align:right;user-select:all}
+@media (max-width:900px){
+  .trade-toggle{height:20px;font-size:10px}
+  .send-full-address{font-size:10px;text-align:left}
+}

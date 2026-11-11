@@ -1,10 +1,18 @@
-# Example only. The app has no built-in authentication.
-# Put this behind forward-auth / SSO / VPN before exposing it.
+# SECURITY: this sample is deliberately fail-closed.
+# Generate a hash with: caddy hash-password
+# Put it in the Caddy systemd environment:
+#   sudo systemctl edit caddy
+#   [Service]
+#   Environment=ADMIN_PASSWORD_HASH=<bcrypt-hash>
+#   sudo systemctl daemon-reload && sudo systemctl restart caddy
+#
+# If ADMIN_PASSWORD_HASH is missing, do not treat this config as usable.
 wallet.example.com {
-    redir /agentic /agentic/ 308
+    encode zstd gzip
 
-    handle_path /agentic/* {
-        # Add forward_auth here in production.
-        reverse_proxy 127.0.0.1:8100
+    basic_auth {
+        admin {$ADMIN_PASSWORD_HASH}
     }
+
+    reverse_proxy 127.0.0.1:8100
 }

@@ -1,4 +1,4 @@
-name: Python syntax
+name: Python tests
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
   pull_request:
 
 jobs:
-  compile:
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -17,3 +17,5 @@ jobs:
         run: pip install -r requirements.txt
       - name: Compile server
         run: python -m py_compile server.py
+      - name: Run offline money-path tests
+        run: python -m unittest discover -s tests -v

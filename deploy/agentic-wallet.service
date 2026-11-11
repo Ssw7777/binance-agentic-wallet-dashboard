@@ -13,6 +13,7 @@ Restart=always
 RestartSec=3
 Environment=PYTHONUNBUFFERED=1
 Environment=HOME=/home/ubuntu
+Environment=BAW_BIN=/home/ubuntu/agent/npm-global/bin/baw
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true

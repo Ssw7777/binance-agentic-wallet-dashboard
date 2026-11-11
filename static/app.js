@@ -231,8 +231,15 @@
     $("#visibleUsd").textContent = fmtUsd(s.visible);
     $("#hiddenUsd").textContent = fmtUsd(s.hidden);
     $("#scopeLine").textContent = `${state.wallet === "all" ? "全部钱包" : walletById(state.wallet).label} · 价格实时校正 · 最优池保护`;
+    const balanceAge = Number(p.balanceAge) || 0;
+    const marketAge = Number(p.marketAge) || 0;
+    const stale = balanceAge > 15 || marketAge > 60;
+    $("#dataDot").classList.toggle("stale", stale);
+    $("#dataFreshness").textContent = stale
+      ? `数据延迟 ${Math.max(Math.round(balanceAge), Math.round(marketAge))}s`
+      : "3 秒刷新";
     $("#balanceAge").textContent = p.balanceAge ?? "—";
-    $("#lastUpdated").textContent = "更新 " + timeAgo(p.updatedAt);
+    $("#lastUpdated").textContent = "缓存 " + timeAgo(p.updatedAt);
   }
 
   function renderWalletManage() {
@@ -245,7 +252,7 @@
       <div class="manage-row">
         <span class="manage-dot" style="--wc:${w.color}"></span>
         <div class="manage-main">
-          <div class="manage-name"><button class="manage-name-btn" data-rename-wallet="${esc(w.id)}" type="button" title="点击修改名称">${esc(w.label)} <svg class="icon"><use href="#i-pen"></use></svg></button><small>${w.status === "online" ? "在线" : "掉线"}</small></div>
+          <div class="manage-name"><button class="manage-name-btn" data-rename-wallet="${esc(w.id)}" type="button" title="点击修改名称">${esc(w.label)} <svg class="icon"><use href="#i-pen"></use></svg></button><small>${w.stale ? "缓存" : w.status === "online" ? "在线" : "掉线"}</small><button class="trade-toggle ${w.trade ? "on" : "off"}" data-trade-wallet="${esc(w.id)}" type="button" title="${w.trade ? "当前可交易，点击设为只读" : "当前只读，点击开启交易"}">${w.trade ? "交易开" : "只读"}</button></div>
           <div class="manage-sub">${esc(w.id)} · ${esc(shortAddr(w.address))}</div>
         </div>
         <div class="manage-val">${fmtUsd(w.balanceUsd)}</div>
@@ -585,7 +592,7 @@
     $("#walletLabel").value = "";
     $("#walletQR").hidden = true;
     $("#walletQRBox").innerHTML = "";
-    $("#walletStatus").textContent = "扫码后会自动创建独立 BAW 会话，不会导入私钥。";
+    $("#walletStatus").textContent = "扫码后会自动创建独立 BAW 会话，不会导入私钥。新钱包默认只读，添加后可在钱包管理开启交易。";
     $("#walletWaiting").textContent = "等待扫码…";
     $("#walletStart").disabled = false;
     $("#walletModal").classList.add("is-open");
@@ -651,6 +658,21 @@
       loadPortfolio();
     } catch (e) {
       toast("移除失败", String(e.message || e), "error");
+    }
+  }
+
+  async function toggleWalletTrade(id) {
+    const w = walletById(id);
+    if (!w) return;
+    const next = !w.trade;
+    if (next && !confirm(`开启「${w.label}」的交易权限？\n开启后可执行卖出和发送。`)) return;
+    try {
+      await api("wallets/" + encodeURIComponent(id) + "/trade", { method: "POST", body: { trade: next } });
+      w.trade = next;
+      render();
+      toast(next ? "交易权限已开启" : "已设为只读", w.label, "success");
+    } catch (e) {
+      toast("修改失败", String(e.message || e), "error");
     }
   }
 
@@ -887,7 +909,8 @@
           amount: s.mode === "amount" ? s.amount : null,
           pct: s.mode === "amount" ? null : s.pct,
           slippage: s.slippage || 1,
-          idempotencyKey: "sell-" + Date.now() + "-" + Math.random().toString(36).slice(2)
+          taxAck: Number(tax.sell) > 10,
+          idempotencyKey: s.idem || (s.idem = "sell-" + Date.now() + "-" + Math.random().toString(36).slice(2))
         }
       });
       pollTask(task.id, "sell");
@@ -898,34 +921,45 @@
 
   async function pollTask(id, kind) {
     const modal = kind === "sell" ? $("#sellModal") : $("#sendModal");
-    for (let i = 0; i < 60; i++) {
-      await new Promise((r) => setTimeout(r, 700));
+    const progress = kind === "sell" ? $("#sellProgress") : $("#sendProgress");
+    const deadline = Date.now() + 240000;
+    let last = null;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 900));
       let task;
       try { task = await api("task/" + encodeURIComponent(id)); } catch { continue; }
       if (!modal.classList.contains("is-open")) return;
-      const progress = kind === "sell" ? $("#sellProgress") : $("#sendProgress");
-      const head = `<div class="progress-head"><strong>${task.status === "submitted" ? "已提交" : task.status === "needs_confirm" ? "等待手机确认" : "正在提交"}</strong><span>${esc(task.status)}</span></div>`;
+      last = task;
+      const terminal = ["submitted", "partial", "failed", "needs_confirm", "unknown"].includes(task.status);
+      const head = `<div class="progress-head"><strong>${task.status === "submitted" ? "已提交" : task.status === "needs_confirm" ? "等待手机确认" : task.status === "partial" ? "部分成功" : task.status === "unknown" ? "结果待核实" : task.status === "failed" ? "失败" : "正在提交"}</strong><span>${esc(task.status)}</span></div>`;
       progress.innerHTML = head + (task.legs || []).map((leg) => {
         const status = leg.status === "submitted" ? "done" : leg.status === "needs_confirm" ? "wait" : leg.status === "failed" ? "fail" : "";
         const text = leg.status === "submitted" ? "已提交" : leg.status === "needs_confirm" ? "需手机确认" : leg.status === "failed" ? "失败" : "进行中";
-        return `<div class="leg ${status}"><span class="leg-ico"><svg class="icon"><use href="#${status === "done" ? "i-check" : status === "fail" ? "i-alert" : "i-clock"}"></use></svg></span><span class="leg-main"><strong>${esc(walletById(leg.wallet).label)}</strong><small>${esc(leg.txHash ? shortAddr(leg.txHash) : leg.error || leg.qty || "准备中")}</small></span><span class="leg-state">${text}</span></div>`;
-      }).join("");
+        return `<div class="leg ${status}"><span class="leg-ico"><svg class="icon"><use href="#${status === "done" ? "i-check" : status === "fail" ? "i-alert" : "i-clock"}"></use></svg></span><span class="leg-main"><strong>${esc(walletById(leg.wallet).label)}</strong><small>${esc(leg.txHash || leg.error || leg.qty || "准备中")}</small></span><span class="leg-state">${text}</span></div>`;
+      }).join("") + `<p class="modal-note">任务 ID：${esc(task.id || id)}</p>`;
+      if (!terminal) continue;
       if (task.status === "needs_confirm") {
         if (kind === "sell") $("#sellPhone").hidden = false;
         toast("需要到手机确认", "请打开币安 App 确认这笔交易", "error");
         break;
       }
-      if (["submitted", "partial", "failed"].includes(task.status)) {
-        if (task.status !== "failed") {
-          toast(kind === "sell" ? "卖出已提交" : "发送已提交", "余额会在几秒内刷新", "success");
-          setTimeout(() => closeModal(kind), 900);
-          setTimeout(loadPortfolio, 900);
-          setTimeout(() => loadHistory(state.wallet, true), 1400);
-        } else {
-          toast(kind === "sell" ? "卖出失败" : "发送失败", "展开任务状态查看原因", "error");
-        }
-        break;
+      setTimeout(loadPortfolio, 500);
+      setTimeout(() => loadHistory(state.wallet, true), 1000);
+      if (task.status === "submitted") {
+        toast(kind === "sell" ? "卖出已提交" : "发送已提交", "余额会在几秒内刷新", "success");
+        setTimeout(() => closeModal(kind), 1200);
+      } else if (task.status === "partial") {
+        toast("部分成功，请逐笔核对", "不要重复提交；先查看失败的钱包和交易记录", "error");
+      } else if (task.status === "unknown") {
+        toast("提交结果待核实", "服务曾重启或超时，请按任务 ID / 交易哈希核对，不要盲目重试", "error");
+      } else {
+        toast(kind === "sell" ? "卖出失败" : "发送失败", "展开任务状态查看原因", "error");
       }
+      break;
+    }
+    if (last && !["submitted", "partial", "failed", "needs_confirm", "unknown"].includes(last.status)) {
+      progress.insertAdjacentHTML("beforeend", `<p class="modal-note">轮询超时，提交结果待核实。任务 ID：${esc(last.id || id)}。请先核对钱包记录，不要重复提交。</p>`);
+      toast("提交结果待核实", "请按任务 ID / 交易哈希核对后再操作", "error");
     }
   }
 
@@ -980,7 +1014,7 @@
       : selected.reduce((s, h) => s + Number(h.qty), 0) * Number(pct) / 100;
     const validAmount = mode === "manual" ? perManual > 0 : Number(pct) > 0;
     $("#sendTokenLabel").textContent = token.symbol;
-    $("#sendAddressLabel").textContent = recipient ? shortAddr(recipient) : "未填写";
+    $("#sendAddressLabel").textContent = recipient || "未填写";
     $("#sendWalletLabel").textContent = `${selected.length} 个`;
     $("#sendTotalLabel").textContent = validAmount ? `${fmtQty(total)} ${token.symbol}` : "—";
     $("#sendQtyHint").textContent = mode === "manual"
@@ -1005,7 +1039,7 @@
           amount: s.mode === "manual" ? s.amount : null,
           pct: s.mode === "manual" ? null : s.pct,
           recipient: s.recipient,
-          idempotencyKey: "send-" + Date.now() + "-" + Math.random().toString(36).slice(2)
+          idempotencyKey: s.idem || (s.idem = "send-" + Date.now() + "-" + Math.random().toString(36).slice(2))
         }
       });
       pollTask(task.id, "send");
@@ -1058,6 +1092,8 @@
       if (del) { deleteWallet(del.dataset.delWallet); return; }
       const rename = e.target.closest("[data-rename-wallet]");
       if (rename) { renameWallet(rename.dataset.renameWallet); return; }
+      const tradeToggle = e.target.closest("[data-trade-wallet]");
+      if (tradeToggle) { toggleWalletTrade(tradeToggle.dataset.tradeWallet); return; }
       const receive = e.target.closest("[data-receive]");
       if (receive) { openReceive(receive.dataset.receive); return; }
       const ownWallet = e.target.closest("[data-own-wallet]");
