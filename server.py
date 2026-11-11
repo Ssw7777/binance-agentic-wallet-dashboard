@@ -64,6 +64,7 @@ _market_cache: dict[str, Any] = {"ts": 0.0, "data": {}}
 BALANCE_PATH = DATA / "balance-cache.json"
 MARKET_PATH = DATA / "market-cache.json"
 _audit_cache: dict[str, dict[str, Any]] = {}
+_decimals_cache: dict[str, int] = {}
 _history_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 HISTORY_DIR = DATA / "history"
 HISTORY_DIR.mkdir(exist_ok=True)
@@ -223,6 +224,98 @@ def rpc_call(method: str, params: list[Any], timeout: int = 8) -> Any:
         except Exception as e:  # noqa: BLE001
             last = repr(e)
     raise RuntimeError(f"rpc failed: {last}")
+
+
+def token_decimals(token: str) -> int:
+    token = token.lower()
+    if token in (NATIVE, WBNB, USDT, USDC):
+        return 18
+    with _cache_lock:
+        cached = _decimals_cache.get(token)
+        if cached is not None:
+            return cached
+    raw = rpc_call("eth_call", [{"to": token, "data": "0x313ce567"}, "latest"], timeout=8)
+    try:
+        decimals = int(str(raw), 16)
+    except Exception as exc:
+        raise ValueError("无法读取代币 decimals，已阻止发送") from exc
+    if not (0 <= decimals <= 36):
+        raise ValueError("代币 decimals 异常，已阻止发送")
+    with _cache_lock:
+        _decimals_cache[token] = decimals
+    return decimals
+
+
+def token_base_units(qty: Decimal, decimals: int) -> int:
+    scaled = qty * (Decimal(10) ** decimals)
+    if scaled != scaled.to_integral_value():
+        raise ValueError("数量小数位超过代币精度")
+    units = int(scaled)
+    if units <= 0:
+        raise ValueError("数量过小")
+    return units
+
+
+def build_transfer_call(token: str, qty: Decimal, recipient: str) -> tuple[str, str, str, int]:
+    token = token.lower()
+    if token == NATIVE:
+        units = token_base_units(qty, 18)
+        return recipient, str(units), "0x", units
+    decimals = token_decimals(token)
+    units = token_base_units(qty, decimals)
+    data = (
+        "0xa9059cbb"
+        + recipient.lower().removeprefix("0x").rjust(64, "0")
+        + format(units, "x").rjust(64, "0")
+    )
+    return token, "0", data, units
+
+
+def contract_send(wallet: str, token: str, qty: Decimal, recipient: str) -> dict[str, Any]:
+    address = wallet_address(wallet)
+    if not address:
+        raise ValueError("无法读取当前 BAW 会话地址")
+    to, value, input_data, units = build_transfer_call(token, qty, recipient)
+    preview = baw(wallet, [
+        "contract-call", "preview",
+        "--binanceChainId", CHAIN,
+        "--from", address,
+        "--to", to,
+        "--value", value,
+        "--inputData", input_data,
+        "--json",
+    ], timeout=70)
+    if not preview.get("success"):
+        return {"ok": False, "needsPhoneConfirm": is_phone_confirm(preview), "error": err_text(preview)}
+    pdata = preview.get("data") or {}
+    sim = pdata.get("simulationResult") or {}
+    sim_code = str(sim.get("simulationCode") or "")
+    if sim_code and sim_code not in ("000000000", "0"):
+        return {"ok": False, "error": f"合约模拟失败：{sim.get('simulationErrorDetail') or sim_code}"}
+    parsed = pdata.get("parsedTx") or {}
+    if str(parsed.get("recipient") or "").lower() != recipient.lower():
+        return {"ok": False, "error": "合约预览收款地址不一致，已阻止"}
+    if token != NATIVE and str(parsed.get("contractAddress") or "").lower() != token:
+        return {"ok": False, "error": "合约预览代币地址不一致，已阻止"}
+    try:
+        if int(parsed.get("amount")) != units:
+            return {"ok": False, "error": "合约预览数量不一致，已阻止"}
+    except Exception:
+        return {"ok": False, "error": "合约预览数量缺失，已阻止"}
+    request_id = str(pdata.get("requestId") or "")
+    if not request_id:
+        return {"ok": False, "error": "合约预览没有返回 requestId"}
+    execute = baw(wallet, ["contract-call", "execute", "--requestId", request_id, "--json"], timeout=100)
+    if not execute.get("success"):
+        return {"ok": False, "needsPhoneConfirm": is_phone_confirm(execute), "error": err_text(execute)}
+    data = execute.get("data") or {}
+    if not isinstance(data, dict):
+        data = {"result": data}
+    data.setdefault("requestId", request_id)
+    data.setdefault("method", "contract-call")
+    data.setdefault("recipient", recipient)
+    data.setdefault("value", value)
+    return {"ok": True, "data": data, "requestId": request_id}
 
 
 def baw(wallet: str, args: list[str], timeout: int = 70) -> dict[str, Any]:
@@ -1183,19 +1276,20 @@ def send_leg(leg: dict[str, Any], token: str, pct: float, recipient: str, amount
         q = fmt_qty(qty, token)
         leg["qty"] = q
         leg["status"] = "submitting"
-        r = baw(wid, [
-            "wallet", "send", "--binanceChainId", CHAIN,
-            "--amount", q, "--tokenAddress", token,
-            "--recipient", recipient, "--gasLevel", "HIGH", "--json",
-        ], timeout=85)
-        if not r.get("success"):
-            if is_phone_confirm(r):
-                leg.update(status="needs_confirm", error=err_text(r))
+        result = contract_send(wid, token, qty, recipient)
+        if not result.get("ok"):
+            if result.get("needsPhoneConfirm"):
+                leg.update(status="needs_confirm", error=result.get("error"))
             else:
-                leg.update(status="failed", error=err_text(r))
+                leg.update(status="failed", error=result.get("error"))
             return
-        data = r.get("data") or {}
-        leg.update(status="submitted", txHash=data.get("txHash"), result=data if isinstance(data, dict) else {})
+        data = result.get("data") or {}
+        tx_hash = data.get("txHash") or data.get("txId") or data.get("hash") or data.get("orderId")
+        status = str(data.get("status") or "").upper()
+        if data.get("requireConfirmation") is True or "CONFIRM" in status:
+            leg.update(status="needs_confirm", txHash=tx_hash, error="需要到币安 App 确认这笔合约调用")
+            return
+        leg.update(status="submitted", txHash=tx_hash, result=data)
 
 
 def start_sell(payload: dict[str, Any]) -> dict[str, Any]:

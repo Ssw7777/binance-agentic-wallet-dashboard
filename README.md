@@ -22,7 +22,8 @@
 - **实时价格**：使用 DexScreener 最深流动性池，显示池子、流动性和交易税。
 - **卖出保护**：BAW 报价和最优池价格对比，低于最优池 8% 自动拦截。
 - **按比例 / 按数量卖出**：两种模式二选一；每个比例下面显示对应数量，输入数量时显示约占比。
-- **发送**：支持手动数量或百分比；可以从一个钱包发给另一个自己的 Agentic 钱包。
+- **发送任意地址**：支持手动数量或百分比；可以直接发给任意 `0x` 地址，不要求先加入币安 App 地址簿。
+- **发送实现**：ERC-20 走 `contract-call` 的 `transfer(address,uint256)`；BNB 走原生 value 转账。地址簿只是可选便利功能，不是发送前置条件。
 - **钱包互转**：发送弹窗里直接选择 W1 → W2、W1 → W3、W1 → W4。
 - **本地地址簿**：只存在浏览器 localStorage；支持新增、修改、复制、发送、删除。
 - **完整地址复制**：钱包管理和地址簿都复制完整 `0x` 地址，不复制缩略地址。
@@ -71,6 +72,7 @@ Python 标准库 HTTP 服务（server.py）
 - **仓库不含真实地址**：默认钱包列表为空；请通过页面扫码或自己的 `data/wallets.json` 配置。
 - **二维码只编码地址**：`/api/qr` 只接受合法的 `0x` + 40 位地址；二维码下方同时显示完整地址，扫码后仍需核对。
 - **新钱包默认只读**：新添加钱包的 `trade` 为 `false`，需要在钱包管理里确认开启后才能卖出/发送。
+- **发送不等于地址簿白名单**：发送使用 BAW `contract-call` 绕过币安 App 地址簿限制；新地址不会被钱包 App 提前拦截，必须由你在提交前核对完整地址。BAW 手机确认/风险控制仍然生效。
 - **后端二次检查**：卖出和发送都会重新检查钱包交易权限、BAW 交易锁，以及 BAW 当前 BSC 地址是否等于看板配置地址。
 - **报价保护**：行情基准缺失、超过 120 秒未更新、交易税未检测、貔貅/高税风险、或报价偏离最优池超过 8% 时，服务端会阻止提交。
 - **提交前重新报价**：服务端在提交前再次调用 BAW 报价；高税（>10%）还会要求 `taxAck`，不能只靠前端弹窗。
@@ -421,7 +423,9 @@ data/
 ## 交易规则摘要
 
 - 价格参考：DexScreener 最深流动性池。
-- 卖出：BAW `market-order swap`；发送：BAW `wallet send`。
+- 卖出：BAW `market-order swap`。
+- 发送：BAW `contract-call`。ERC-20 调用 `transfer(address,uint256)`；BNB 用原生 value。**不需要地址簿白名单**。
+- 发送前服务端校验合约预览的收款地址、代币合约和数量；执行前仍可能触发币安手机确认。
 - 行情基准缺失、池子无流动性、或超过 **120 秒**未更新：阻止提交。
 - 交易税未完成检测、风险检测中、貔貅/高税：阻止提交。
 - 报价偏离最优池低于 **-8%**：拦截；**-3% 到 -8%**：提示。
@@ -436,7 +440,7 @@ data/
 python3 -m unittest discover -s tests -v
 ```
 
-测试覆盖数量格式化（整数尾零）、非法数量、税率清洗、缺失行情基准拦截、只读钱包发送拦截、任务持久化和幂等。测试不调用真实钱包或交易接口。
+测试覆盖数量格式化（整数尾零）、非法数量、税率清洗、缺失行情基准拦截、只读钱包发送拦截、任务持久化、幂等，以及 ERC-20 calldata / 原生 value 编码。测试不调用真实钱包或交易接口。
 
 ## 免责声明
 
@@ -505,6 +509,7 @@ Python stdlib HTTP server (server.py)
 - **No real wallet addresses in this repository.** `DEFAULT_WALLETS` is empty; configure via the QR flow or `data/wallets.json`.
 - **Exact-address QR.** `/api/qr` accepts only a valid `0x` + 40-hex address and displays the full address below the QR.
 - **New wallets are read-only.** New wallets start with `trade: false`; enable trading explicitly in wallet management.
+- **Sends bypass the address-book whitelist** via BAW `contract-call`. The Binance App will not pre-block a new address, so you must verify the full address before confirming. Binance phone confirmation/risk controls still apply.
 - **Backend checks.** Sell and send both re-check trade permission, the BAW transaction lock, and that the BAW BSC address matches the configured address.
 - **Quote guard.** Missing/stale market data (>120s), unknown tax, honeypot/high-tax risk, or a quote more than 8% below the best pool blocks submission.
 - **Re-quote + tax ack.** The server re-quotes immediately before submission; sell tax above 10% requires a backend `taxAck`, not just a browser dialog.
@@ -811,7 +816,9 @@ Mutating requests require `X-Requested-With: agentic` and JSON bodies.
 ## Trading rules
 
 - Price reference: DexScreener deepest-liquidity pool.
-- Sells use BAW `market-order swap`; sends use `wallet send`.
+- Sells use BAW `market-order swap`.
+- Sends use BAW `contract-call`: ERC-20 `transfer(address,uint256)`; native BNB value transfer. **The Binance App address book is not required.**
+- The server verifies the preview's recipient, token contract, and amount before execute; Binance phone confirmation/risk controls can still apply.
 - Missing/stale baseline (>120s) or no pool liquidity: blocked.
 - Unknown tax, pending risk check, honeypot/high-tax: blocked.
 - Quote below **-8%** vs. best pool: blocked; **-3% to -8%**: warning.
