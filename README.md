@@ -31,7 +31,7 @@
 - **收款二维码**：服务端按当前钱包完整地址生成二维码，二维码下方再次显示完整地址。
 - **风险过滤**：默认隐藏小额、低流动性、貔貅、高税代币；过滤详情可展开。
 - **交易税提醒**：买卖税显示在持仓表和卖出弹窗；卖出税高于 10% 会再额外确认一次。
-- **会话状态**：每 15 秒并行执行 `baw wallet status`；在币安 App 退出登录后，钱包标签和管理列表会显示“已退出”，右上角状态变红。发送/卖出失败时也会立即标记对应会话，不必等下一轮。
+- **会话状态**：每 15 秒并行执行 `baw wallet status`；在币安 App 退出登录后，钱包标签和管理列表会显示红字“已退出”，并出现“重新登录”按钮。重新登录复用原来的 `wN` 会话目录，不会新建 W11 之类的钱包编号。发送/卖出失败时也会立即标记对应会话，不必等下一轮。
 - **后台保活**：持续检查会话；右上角绿/红状态，点开看每个钱包。
 - **钱包管理**：重命名、复制地址、扫码添加、从看板移除。
 - **双端布局**：桌面端、手机竖屏、手机横屏分别适配。
@@ -483,7 +483,7 @@ Independent project. Not affiliated with or endorsed by Binance.
 - Server-generated receive QR codes from the exact wallet address, with the full address shown underneath.
 - Risk filtering for dust, low liquidity, honeypots, and high-tax tokens, with collapsible details.
 - Buy/sell tax visibility; sells above 10% tax require a second confirmation.
-- Session status checked every 15 seconds via `baw wallet status`, with green/red status in the header. Logging out in the Binance App changes the wallet badge to “已退出” within one interval; a failed send/sell marks it immediately.
+- Session status checked every 15 seconds via `baw wallet status`, with green/red status in the header. Logging out in the Binance App changes the wallet badge to red “已退出” and shows a re-login button; re-login uses the same `wN` session directory, never creates a new W11-style wallet. A failed send/sell marks it immediately.
 - Wallet rename, address copy, QR onboarding, and dashboard removal.
 - Desktop, phone portrait, and phone landscape layouts.
 

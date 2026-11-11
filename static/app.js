@@ -28,6 +28,7 @@
     sell: null,
     send: null,
     walletAdd: null,
+    walletLogin: null,
     book: loadBook(),
     quoteSeq: 0
   };
@@ -258,7 +259,7 @@
       <div class="manage-row">
         <span class="manage-dot" style="--wc:${w.color}"></span>
         <div class="manage-main">
-          <div class="manage-name"><button class="manage-name-btn" data-rename-wallet="${esc(w.id)}" type="button" title="点击修改名称">${esc(w.label)} <svg class="icon"><use href="#i-pen"></use></svg></button><small>${w.stale ? "缓存 · " : ""}${esc(sessionLabel(w))}</small><button class="trade-toggle ${w.trade ? "on" : "off"}" data-trade-wallet="${esc(w.id)}" type="button" title="${w.trade ? "当前可交易，点击设为只读" : "当前只读，点击开启交易"}">${w.trade ? "交易开" : "只读"}</button></div>
+          <div class="manage-name"><button class="manage-name-btn" data-rename-wallet="${esc(w.id)}" type="button" title="点击修改名称">${esc(w.label)} <svg class="icon"><use href="#i-pen"></use></svg></button><small class="${w.status === "online" ? "" : "off"}">${w.stale ? "缓存 · " : ""}${esc(sessionLabel(w))}${w.status === "offline" ? " · 需要重新登录或移除" : ""}</small><button class="trade-toggle ${w.trade ? "on" : "off"}" data-trade-wallet="${esc(w.id)}" type="button" title="${w.trade ? "当前可交易，点击设为只读" : "当前只读，点击开启交易"}">${w.trade ? "交易开" : "只读"}</button>${w.status === "offline" ? `<button class="relogin-btn" data-relogin-wallet="${esc(w.id)}" type="button">重新登录</button>` : ""}</div>
           <div class="manage-sub">${esc(w.id)} · ${esc(shortAddr(w.address))}</div>
         </div>
         <div class="manage-val">${fmtUsd(w.balanceUsd)}</div>
@@ -284,7 +285,7 @@
       const status = k?.status || "UNKNOWN";
       const ok = status === "CONNECTED";
       const label = ok ? "在线" : status === "UNCONNECTED" ? "已退出" : status === "UNKNOWN" ? "未知" : status;
-      return `<div class="ka-row ${ok ? "" : "off"}"><span class="ka-dot ${ok ? "" : "off"}"></span><span class="ka-name">${esc(w.label)}</span><span class="ka-state">${esc(label)}</span><span class="ka-time">${k?.at ? timeAgo(k.at) : "未检查"}</span></div>`;
+      return `<div class="ka-row ${ok ? "" : "off"}"><span class="ka-dot ${ok ? "" : "off"}"></span><span class="ka-name">${esc(w.label)}</span><span class="ka-state">${esc(label)}</span><span class="ka-time">${k?.at ? timeAgo(k.at) : "未检查"}</span>${ok ? "" : `<button class="ka-login" data-relogin-wallet="${esc(w.id)}" type="button">重新登录</button>`}</div>`;
     }).join("") : `<div class="manage-empty">暂无会话</div>`;
   }
 
@@ -611,33 +612,46 @@
     toast("已保存地址", "仅保存在当前浏览器", "success");
   }
 
-  function openWalletModal() {
+  function openWalletModal(reloginId = null) {
+    const w = reloginId ? walletById(reloginId) : null;
     state.walletAdd = null;
+    state.walletLogin = w ? w.id : null;
     $("#walletLabel").value = "";
+    $("#walletLabelField").hidden = Boolean(w);
+    $("#walletTitle").textContent = w ? `重新登录 ${w.label}` : "添加 Agentic 钱包";
+    $("#walletSubtitle").textContent = w ? "扫码重新授权同一个 BAW 会话，不会新建钱包编号" : "用币安 App 扫码授权新会话";
+    $("#walletStart").textContent = w ? "生成重新登录二维码" : "生成扫码二维码";
     $("#walletQR").hidden = true;
     $("#walletQRBox").innerHTML = "";
-    $("#walletStatus").textContent = "扫码后会自动创建独立 BAW 会话，不会导入私钥。新钱包默认只读，添加后可在钱包管理开启交易。";
+    $("#walletStatus").textContent = w
+      ? `当前 ${w.id} 已退出。扫码后只恢复 ${w.id} 的会话，不会变成 W11 之类的编号。`
+      : "扫码后会自动创建独立 BAW 会话，不会导入私钥。新钱包默认只读，添加后可在钱包管理开启交易。";
     $("#walletWaiting").textContent = "等待扫码…";
     $("#walletStart").disabled = false;
     $("#walletModal").classList.add("is-open");
     $("#walletModal").setAttribute("aria-hidden", "false");
-    setTimeout(() => $("#walletLabel")?.focus(), 100);
+    setTimeout(() => (w ? $("#walletStart") : $("#walletLabel"))?.focus(), 100);
   }
 
   async function startWalletAdd() {
     const label = $("#walletLabel").value.trim();
+    const loginId = state.walletLogin;
     $("#walletStart").disabled = true;
-    $("#walletStatus").textContent = "正在生成二维码…";
+    $("#walletStatus").textContent = loginId ? `正在为 ${loginId} 生成重新登录二维码…` : "正在生成二维码…";
     try {
-      const r = await api("wallets/start", { method: "POST", body: { label } });
+      const r = loginId
+        ? await api("wallets/" + encodeURIComponent(loginId) + "/relogin", { method: "POST", body: {} })
+        : await api("wallets/start", { method: "POST", body: { label } });
       if (!r.ok) throw new Error(r.error || "生成失败");
-      state.walletAdd = { slot: r.slot, timer: null };
+      state.walletAdd = { slot: r.slot, timer: null, relogin: Boolean(loginId) };
       $("#walletQR").hidden = false;
       $("#walletQRBox").innerHTML = r.qrSvg || "";
       $("#walletPairing").textContent = r.pairingCode || "—";
       $("#walletExpiry").textContent = r.expiresIn ? Math.max(0, Math.round(r.expiresIn / 60)) + " 分钟" : "—";
       $("#walletUrl").href = r.url || "#";
-      $("#walletStatus").textContent = `钱包 ${r.slot} 已创建会话目录，请用币安 App 扫码。`;
+      $("#walletStatus").textContent = loginId
+        ? `请用币安 App 扫码，重新授权 ${loginId}；二维码不会创建新钱包。`
+        : `钱包 ${r.slot} 已创建会话目录，请用币安 App 扫码。`;
       $("#walletWaiting").textContent = "等待扫码…";
       state.walletAdd.timer = setInterval(pollWalletAdd, 1600);
     } catch (e) {
@@ -651,10 +665,12 @@
     try {
       const r = await api("wallets/pending?slot=" + encodeURIComponent(state.walletAdd.slot));
       if (r.status === "added") {
+        const wasRelogin = state.walletAdd.relogin;
         clearInterval(state.walletAdd.timer);
-        $("#walletWaiting").textContent = "已添加，正在刷新资产…";
-        toast("钱包已添加", `${r.wallet?.label || state.walletAdd.slot} 已上线`, "success");
+        $("#walletWaiting").textContent = wasRelogin ? "已重新登录，正在刷新资产…" : "已添加，正在刷新资产…";
+        toast(wasRelogin ? "会话已恢复" : "钱包已添加", `${r.wallet?.label || state.walletAdd.slot} 已上线`, "success");
         state.walletAdd = null;
+        state.walletLogin = null;
         state.historyCache = {};
         setTimeout(() => closeModal("wallet"), 900);
         loadPortfolio();
@@ -1097,8 +1113,8 @@
     $("#bookAddBtn").addEventListener("click", () => showBookForm(true));
     $("#bookCancel").addEventListener("click", () => showBookForm(false));
     $("#bookSave").addEventListener("click", saveBookEntry);
-    $("#addWalletBtn").addEventListener("click", openWalletModal);
-    $("#railAddWallet").addEventListener("click", openWalletModal);
+    $("#addWalletBtn").addEventListener("click", () => openWalletModal());
+    $("#railAddWallet").addEventListener("click", () => openWalletModal());
     $("#walletStart").addEventListener("click", startWalletAdd);
     $("#hideLow").addEventListener("change", (e) => { state.hideLow = e.target.checked; state.showAll = !e.target.checked; render(); });
     $("#noticeShow").addEventListener("click", () => { state.showAll = !state.showAll; $("#hideLow").checked = !state.showAll; render(); });
@@ -1139,6 +1155,8 @@
         if (state.send.wallets.includes(w.id)) toast("注意", "收款地址也是本次发送钱包之一，请核对", "error");
         return;
       }
+      const relogin = e.target.closest("[data-relogin-wallet]");
+      if (relogin) { openWalletModal(relogin.dataset.reloginWallet); return; }
       const sendBook = e.target.closest("[data-send-book]");
       if (sendBook && state.send) {
         const address = sendBook.dataset.sendBook;
@@ -1326,6 +1344,7 @@
     if (name === "wallet") {
       if (state.walletAdd?.timer) clearInterval(state.walletAdd.timer);
       state.walletAdd = null;
+      state.walletLogin = null;
       $("#walletStart").disabled = false;
     }
   }

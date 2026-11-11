@@ -1619,6 +1619,50 @@ def start_wallet_add(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def start_wallet_relogin(wallet_id: str) -> dict[str, Any]:
+    w = WALLET_BY_ID.get(wallet_id)
+    if not w:
+        return {"ok": False, "error": "wallet not found"}
+    now_ms = int(time.time() * 1000)
+    for pending_slot, pending in list(_pending_wallets.items()):
+        if int(pending.get("expireAt") or 0) and int(pending["expireAt"]) < now_ms - 3_600_000:
+            _pending_wallets.pop(pending_slot, None)
+    r = baw(wallet_id, ["auth", "signin", "--json"], timeout=70)
+    if not r.get("success"):
+        return {"ok": False, "error": err_text(r)}
+    data = r.get("data") or {}
+    url = str(data.get("urlForWeb") or "")
+    qr_id = str(data.get("qrCodeId") or "")
+    if not url or not qr_id:
+        return {"ok": False, "error": "BAW 没有返回二维码"}
+    expire_at = int(data.get("expireAt") or 0)
+    expires_in = max(0, int(expire_at / 1000 - time.time())) if expire_at > 10_000_000_000 else 300
+    pending = {
+        "slot": wallet_id,
+        "label": w.get("label") or wallet_id,
+        "url": url,
+        "qrCodeId": qr_id,
+        "pairingCode": str(data.get("pairingCode") or ""),
+        "expireAt": expire_at,
+        "status": "waiting",
+        "error": None,
+        "wallet": None,
+        "relogin": True,
+        "expectedAddress": str(w.get("address") or ""),
+        "at": now_iso(),
+    }
+    _pending_wallets[wallet_id] = pending
+    threading.Thread(target=_verify_wallet, args=(wallet_id, qr_id), daemon=True).start()
+    return {
+        "ok": True,
+        "slot": wallet_id,
+        "url": url,
+        "qrSvg": qr_svg(url),
+        "pairingCode": pending["pairingCode"],
+        "expiresIn": expires_in,
+    }
+
+
 def _verify_wallet(slot: str, qr_id: str) -> None:
     pending = _pending_wallets.get(slot)
     if not pending:
@@ -1634,18 +1678,34 @@ def _verify_wallet(slot: str, qr_id: str) -> None:
         pending["error"] = "二维码已确认，但读取 BSC 地址失败"
         return
     label = pending.get("label") or f"钱包 {slot}"
-    with _config_lock:
-        # A duplicate slot cannot happen, but keep the config clean.
-        WALLETS[:] = [w for w in WALLETS if w["id"] != slot]
-        _apply_wallets(WALLETS + [{
-            "id": slot,
-            "label": label,
-            "agent": label,
-            "address": addr,
-            "color": COLORS[len(WALLETS) % len(COLORS)],
-            "trade": False,
-        }])
-        save_wallet_config()
+    existing = WALLET_BY_ID.get(slot)
+    if existing:
+        expected = str(pending.get("expectedAddress") or "")
+        if expected and addr.lower() != expected.lower():
+            pending["status"] = "failed"
+            pending["error"] = f"扫码钱包地址与 {slot} 原地址不一致，未替换"
+            return
+        with _config_lock:
+            existing["address"] = addr
+            save_wallet_config()
+    else:
+        duplicate = next((w for w in WALLETS if str(w.get("address") or "").lower() == addr.lower()), None)
+        if duplicate:
+            pending["status"] = "failed"
+            pending["error"] = f"该地址已绑定 {duplicate['id']}，请用它自己的“重新登录”"
+            return
+        with _config_lock:
+            # A duplicate slot cannot happen, but keep the config clean.
+            WALLETS[:] = [w for w in WALLETS if w["id"] != slot]
+            _apply_wallets(WALLETS + [{
+                "id": slot,
+                "label": label,
+                "agent": label,
+                "address": addr,
+                "color": COLORS[len(WALLETS) % len(COLORS)],
+                "trade": False,
+            }])
+            save_wallet_config()
     pending["status"] = "added"
     pending["wallet"] = dict(WALLET_BY_ID.get(slot) or {})
     pending["error"] = None
@@ -1903,6 +1963,9 @@ class Handler(BaseHTTPRequestHandler):
             payload = self._payload()
             if path == "/api/wallets/start":
                 return self._json(start_wallet_add(payload))
+            if path.startswith("/api/wallets/") and path.endswith("/relogin"):
+                wallet_id = path[len("/api/wallets/"):-len("/relogin")].strip("/")
+                return self._json(start_wallet_relogin(wallet_id))
             if path.startswith("/api/wallets/") and path.endswith("/rename"):
                 wallet_id = path[len("/api/wallets/"):-len("/rename")].strip("/")
                 return self._json(rename_wallet(wallet_id, str(payload.get("label") or "")))
