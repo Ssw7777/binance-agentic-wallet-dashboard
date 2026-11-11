@@ -1176,6 +1176,8 @@
         if (state.send.wallets.includes(w.id)) toast("注意", "收款地址也是本次发送钱包之一，请核对", "error");
         return;
       }
+      const resources = e.target.closest("[data-open-resources]");
+      if (resources) { $("#resourcesModal").classList.add("is-open"); $("#resourcesModal").setAttribute("aria-hidden", "false"); return; }
       const recheck = e.target.closest("[data-task-recheck]");
       if (recheck) { pollTask(recheck.dataset.taskRecheck, recheck.dataset.taskKind || "send"); return; }
       const relogin = e.target.closest("[data-relogin-wallet]");

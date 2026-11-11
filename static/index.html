@@ -190,9 +190,39 @@
 
     <footer class="app-foot">
       <span><svg class="icon"><use href="#i-shield"></use></svg> 私钥不离开币安钱包 · 服务端仅调用 BAW 会话</span>
+      <button class="foot-resource" type="button" data-open-resources aria-haspopup="dialog">
+        <svg class="icon"><use href="#i-external"></use></svg> 资源 · 手续费
+      </button>
       <span>BAW 1.12.0 · BSC · 0xStudy Agentic</span>
     </footer>
   </main>
+
+  <!-- RESOURCES -->
+  <div class="modal" id="resourcesModal" aria-hidden="true">
+    <div class="modal-bg" data-close="resources"></div>
+    <div class="modal-card resources-card" role="dialog" aria-modal="true" aria-labelledby="resourcesTitle">
+      <div class="modal-head">
+        <div class="modal-symbol"><svg class="icon"><use href="#i-external"></use></svg></div>
+        <div class="modal-title"><h2 id="resourcesTitle">资源</h2><p>第三方注册链接，按需使用</p></div>
+        <button class="icon-btn" data-close="resources" type="button" aria-label="关闭"><svg class="icon"><use href="#i-close"></use></svg></button>
+      </div>
+      <div class="resources-body">
+        <div class="resources-links">
+          <a class="fee-link okx" href="https://web3.okx.com/join/0XSTUDY" target="_blank" rel="noopener noreferrer">
+            <span class="fee-brand">OKX</span>
+            <span class="fee-text"><strong>OKX 省手续费</strong><small>专属注册链接</small></span>
+            <svg class="icon fee-out"><use href="#i-external"></use></svg>
+          </a>
+          <a class="fee-link binance" href="https://web3.binance.com/referral?ref=0XSTUDY" target="_blank" rel="noopener noreferrer">
+            <span class="fee-brand">BN</span>
+            <span class="fee-text"><strong>币安省手续费</strong><small>专属注册链接</small></span>
+            <svg class="icon fee-out"><use href="#i-external"></use></svg>
+          </a>
+        </div>
+        <p class="resources-note">这些是第三方注册链接，是否使用不影响看板功能。本项目不是 Binance 或 OKX 官方产品，与其无隶属关系。</p>
+      </div>
+    </div>
+  </div>
 
   <!-- SELL -->
   <div class="modal" id="sellModal" aria-hidden="true">

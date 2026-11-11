@@ -1605,3 +1605,31 @@ body{font-size:18px}
 @media (max-width: 900px){.relogin-btn{height:24px;font-size:11px}.ka-login{height:24px;font-size:11px}}
 .pick.is-off{opacity:.55;cursor:not-allowed}
 .pick.is-off .pick-name small{color:var(--red);font-weight:650}
+/* fee referral links in the footer */
+.foot-links{display:flex;align-items:center;justify-content:center;gap:7px;flex-wrap:wrap;min-width:0}
+.fee-link{display:inline-flex;align-items:center;gap:7px;height:34px;padding:0 9px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--ink);text-decoration:none;line-height:1;transition:border-color .15s,transform .15s,box-shadow .15s}
+.fee-link:hover{border-color:var(--accent);transform:translateY(-1px);box-shadow:0 4px 12px rgba(31,42,55,.08)}
+.fee-brand{display:inline-flex;align-items:center;justify-content:center;width:26px;height:20px;border-radius:5px;font-size:9px;font-weight:850;letter-spacing:.02em}
+.fee-link.okx .fee-brand{background:#101114;color:#fff}
+.fee-link.binance .fee-brand{background:#f0b90b;color:#171a1f}
+.fee-text{display:flex;flex-direction:column;align-items:flex-start;gap:2px;white-space:nowrap}
+.fee-text strong{font-size:10px;font-weight:750;color:var(--ink)}
+.fee-text small{font-size:8px;font-weight:550;color:var(--muted)}
+.fee-out{width:12px;height:12px;color:var(--muted);flex:0 0 auto}
+.fee-link:hover .fee-out{color:var(--accent)}
+@media (max-width: 1300px){.foot-links{order:3;flex-basis:100%;justify-content:flex-start}}
+/* compact footer resource entry and its modal */
+.foot-resource{display:inline-flex;align-items:center;gap:6px;height:30px;padding:0 10px;border:1px solid var(--line);border-radius:7px;background:var(--card);color:var(--ink-3);font-size:11px;font-weight:650;cursor:pointer;white-space:nowrap}
+.foot-resource .icon{width:13px;height:13px}
+.foot-resource:hover{color:var(--accent);border-color:var(--accent)}
+.resources-card{width:min(430px,100%)}
+.resources-body{padding:16px 18px 18px}
+.resources-links{display:flex;flex-direction:column;gap:9px}
+.resources-links .fee-link{width:100%;height:52px;justify-content:flex-start;padding:0 14px;border-radius:10px}
+.resources-links .fee-brand{width:38px;height:28px;border-radius:6px;font-size:11px}
+.resources-links .fee-text strong{font-size:13px}
+.resources-links .fee-text small{font-size:10px}
+.resources-links .fee-out{width:15px;height:15px;margin-left:auto}
+.resources-note{margin:13px 0 0;padding-top:11px;border-top:1px solid var(--line);font-size:10px;line-height:1.6;color:var(--muted)}
+.resources-note a{color:var(--accent)}
+@media (max-width: 900px){.foot-resource{height:28px;font-size:11px}.resources-card{width:100%}}
