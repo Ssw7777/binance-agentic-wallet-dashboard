@@ -24,6 +24,8 @@
 - **按比例 / 按数量卖出**：两种模式二选一；每个比例下面显示对应数量，输入数量时显示约占比。
 - **发送任意地址**：支持手动数量或百分比；可以直接发给任意 `0x` 地址，不要求先加入币安 App 地址簿。
 - **发送实现**：ERC-20 走 `contract-call` 的 `transfer(address,uint256)`；BNB 走原生 value 转账。地址簿只是可选便利功能，不是发送前置条件。
+- **余额精度**：有些代币余额的小数位会比链上 `decimals` 更多；发送时按链上精度向下截断，最多留下极小 dust，不会因为多一位小数直接失败。
+- **离线钱包**：会话已退出的钱包不能勾选发送，必须先在钱包管理里“重新登录”；发送失败会在弹窗里显示每个钱包的具体原因。
 - **钱包互转**：发送弹窗里直接选择 W1 → W2、W1 → W3、W1 → W4。
 - **交易记录**：合约调用会读取 BSC 交易回执里的 ERC-20 `Transfer` / 原生 BNB，尽量还原成“发送 / 接收 / 交易”和具体数量，不再只显示“合约 —”。
 - **本地地址簿**：只存在浏览器 localStorage；支持新增、修改、复制、发送、删除；发送弹窗会自动列出地址簿地址，点一下填入。
@@ -822,6 +824,8 @@ Mutating requests require `X-Requested-With: agentic` and JSON bodies.
 - Price reference: DexScreener deepest-liquidity pool.
 - Sells use BAW `market-order swap`.
 - Sends use BAW `contract-call`: ERC-20 `transfer(address,uint256)`; native BNB value transfer. **The Binance App address book is not required.**
+- Extra balance precision is truncated to the token's on-chain decimals, leaving at most dust instead of failing.
+- Logged-out wallets cannot be selected for sends; re-login first. Failures show per-wallet reasons in the modal.
 - The server verifies the preview's recipient, token contract, and amount before execute; Binance phone confirmation/risk controls can still apply.
 - Missing/stale baseline (>120s) or no pool liquidity: blocked.
 - Unknown tax / pending risk check: marked `taxUnknown`; browser confirmation plus backend `taxUnknownAck` allows the sell.

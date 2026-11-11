@@ -26,9 +26,15 @@ class ContractSendTests(unittest.TestCase):
         self.assertEqual(units, 500_000_000_000_000)
         self.assertEqual(data, "0x")
 
-    def test_precision_rejected(self):
-        with self.assertRaises(ValueError):
-            server.token_base_units(Decimal("1.1234567890123456789"), 18)
+    def test_extra_precision_truncated(self):
+        self.assertEqual(
+            server.token_base_units(Decimal("1.1234567890123456789"), 18),
+            1_123_456_789_012_345_678,
+        )
+        self.assertEqual(
+            server.token_base_units(Decimal("652.9205138214195022412"), 18),
+            652_920_513_821_419_502_241,
+        )
 
 
 if __name__ == "__main__":

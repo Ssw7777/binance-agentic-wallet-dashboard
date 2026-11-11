@@ -984,7 +984,7 @@
         const status = leg.status === "submitted" ? "done" : leg.status === "needs_confirm" ? "wait" : leg.status === "failed" ? "fail" : "";
         const text = leg.status === "submitted" ? "已提交" : leg.status === "needs_confirm" ? "需手机确认" : leg.status === "failed" ? "失败" : "进行中";
         return `<div class="leg ${status}"><span class="leg-ico"><svg class="icon"><use href="#${status === "done" ? "i-check" : status === "fail" ? "i-alert" : "i-clock"}"></use></svg></span><span class="leg-main"><strong>${esc(walletById(leg.wallet).label)}</strong><small>${esc(leg.txHash || leg.error || leg.qty || "准备中")}</small></span><span class="leg-state">${text}</span></div>`;
-      }).join("") + `<p class="modal-note">任务 ID：${esc(task.id || id)}</p>`;
+      }).join("") + `<p class="modal-note">任务 ID：${esc(task.id || id)}</p>` + (task.error ? `<p class="modal-note">错误：${esc(String(task.error).split("\n").filter(Boolean).slice(-1)[0])}</p>` : "");
       if (!terminal) continue;
       if (task.status === "needs_confirm") {
         if (kind === "sell") $("#sellPhone").hidden = false;
@@ -1001,7 +1001,7 @@
       } else if (task.status === "unknown") {
         toast("提交结果待核实", "服务曾重启或超时，请按任务 ID / 交易哈希核对，不要盲目重试", "error");
       } else {
-        toast(kind === "sell" ? "卖出失败" : "发送失败", "展开任务状态查看原因", "error");
+        toast(kind === "sell" ? "卖出失败" : "发送失败", "看弹窗里的逐号失败原因；不要重复提交", "error");
       }
       break;
     }
@@ -1019,7 +1019,11 @@
     let holders = token.holders || [];
     if (state.wallet !== "all") holders = holders.filter((h) => h.wallet === state.wallet);
     if (!holders.length) return toast("没有可发送的钱包", "切换钱包后再试", "error");
-    const selected = state.wallet !== "all" ? [state.wallet] : [holders[0].wallet];
+    const online = holders.filter((h) => walletById(h.wallet)?.status === "online");
+    let selected = [];
+    if (state.wallet !== "all" && online.some((h) => h.wallet === state.wallet)) selected = [state.wallet];
+    else if (online.length) selected = [online[0].wallet];
+    if (!online.length) toast("持有钱包已退出", "先在钱包管理点“重新登录”，再发送", "error");
     state.send = { token, holders, wallets: selected, mode: "manual", amount: "", pct: null, recipient: presetRecipient || "" };
     $("#sendSymbolBig").textContent = String(token.symbol || "?").toUpperCase();
     $("#sendTitle").textContent = `发送 ${token.symbol}`;
@@ -1041,11 +1045,12 @@
     const { token, holders, wallets } = state.send;
     $("#sendWallets").innerHTML = holders.map((h) => {
       const w = walletById(h.wallet);
-      return `<label class="pick ${wallets.includes(h.wallet) ? "is-on" : ""}">
-        <input type="checkbox" data-send-wallet="${h.wallet}" ${wallets.includes(h.wallet) ? "checked" : ""}>
+      const offline = w.status !== "online";
+      return `<label class="pick ${wallets.includes(h.wallet) ? "is-on" : ""} ${offline ? "is-off" : ""}">
+        <input type="checkbox" data-send-wallet="${h.wallet}" ${wallets.includes(h.wallet) ? "checked" : ""} ${offline ? "disabled" : ""}>
         <span class="pick-box"><svg class="icon"><use href="#i-check"></use></svg></span>
         ${walletTag(w)}
-        <span class="pick-name"><strong>${esc(w.label)}</strong><small>${esc(shortAddr(w.address))}</small></span>
+        <span class="pick-name"><strong>${esc(w.label)}</strong><small>${offline ? "会话已退出，需重新登录" : esc(shortAddr(w.address))}</small></span>
         <span class="pick-bal">${fmtQty(h.qty)} ${esc(token.symbol)}<small>${fmtUsd(h.value)}</small></span>
       </label>`;
     }).join("");
@@ -1069,7 +1074,7 @@
     $("#sendQtyHint").textContent = mode === "manual"
       ? (validAmount ? `每号 ${fmtQty(perManual)} · 合计 ${fmtQty(total)}` : "手动输入数量")
       : (validAmount ? `合计 ${fmtQty(total)}` : "选择百分比");
-    $("#sendConfirm").textContent = `确认发送 · ${selected.length} 个钱包`;
+    $("#sendConfirm").textContent = selected.length ? `确认发送 · ${selected.length} 个钱包` : "没有可用钱包";
     $("#sendConfirm").disabled = !recipient || !/^0x[a-fA-F0-9]{40}$/.test(recipient) || !selected.length || !validAmount;
   }
 

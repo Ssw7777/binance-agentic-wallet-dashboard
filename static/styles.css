@@ -1603,3 +1603,5 @@ body{font-size:18px}
 .ka-login{height:22px;padding:0 8px;border:1px solid color-mix(in srgb,var(--red) 40%,var(--line));border-radius:5px;background:var(--red-soft);color:var(--red);font-size:10px;font-weight:700;cursor:pointer;white-space:nowrap}
 .ka-login:hover{border-color:var(--red)}
 @media (max-width: 900px){.relogin-btn{height:24px;font-size:11px}.ka-login{height:24px;font-size:11px}}
+.pick.is-off{opacity:.55;cursor:not-allowed}
+.pick.is-off .pick-name small{color:var(--red);font-weight:650}

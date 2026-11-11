@@ -260,9 +260,11 @@ def token_decimals(token: str) -> int:
 
 
 def token_base_units(qty: Decimal, decimals: int) -> int:
+    # Token balances can carry more decimal places than the token itself
+    # (for example 652.9205138214195022412 with 18 decimals).  Sending the
+    # truncated base-unit amount is exact on-chain and leaves only dust; it
+    # must not turn a 100% send into a hard failure.
     scaled = qty * (Decimal(10) ** decimals)
-    if scaled != scaled.to_integral_value():
-        raise ValueError("数量小数位超过代币精度")
     units = int(scaled)
     if units <= 0:
         raise ValueError("数量过小")
@@ -1402,12 +1404,14 @@ def run_send_task(task: dict[str, Any], token: str, pct: float, recipient: str, 
     task["status"] = "running"
     try:
         with ThreadPoolExecutor(max_workers=min(3, len(task["legs"]))) as ex:
-            futures = [ex.submit(send_leg, leg, token, pct, recipient, amount) for leg in task["legs"]]
+            futures = {ex.submit(send_leg, leg, token, pct, recipient, amount): leg for leg in task["legs"]}
             for f in as_completed(futures):
+                leg = futures[f]
                 try:
                     f.result()
                 except Exception as e:  # noqa: BLE001
-                    pass
+                    leg["status"] = "failed"
+                    leg["error"] = str(e) or repr(e)
         statuses = {l.get("status") for l in task["legs"]}
         if "needs_confirm" in statuses:
             task["status"] = "needs_confirm"
@@ -1454,7 +1458,11 @@ def send_leg(leg: dict[str, Any], token: str, pct: float, recipient: str, amount
         q = fmt_qty(qty, token)
         leg["qty"] = q
         leg["status"] = "submitting"
-        result = contract_send(wid, token, qty, recipient)
+        try:
+            result = contract_send(wid, token, qty, recipient)
+        except Exception as e:  # noqa: BLE001
+            leg.update(status="failed", error=str(e) or repr(e))
+            return
         if not result.get("ok"):
             if result.get("needsPhoneConfirm"):
                 leg.update(status="needs_confirm", error=result.get("error"))
