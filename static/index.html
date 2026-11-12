@@ -39,6 +39,7 @@
       </div>
       <div class="hero-actions">
         <div class="view-switch" role="tablist" aria-label="视图">
+          <button id="agcTab" type="button">AGC 项目</button>
           <button id="assetsTab" class="is-active" type="button">资产</button>
           <button id="historyTab" type="button">交易记录</button>
           <button id="bookTab" type="button">地址簿</button>
@@ -64,6 +65,28 @@
       <nav class="wallet-strip" id="walletTabs" aria-label="钱包筛选"></nav>
       <button id="addWalletBtn" class="add-wallet" type="button"><svg class="icon"><use href="#i-plus"></use></svg>添加钱包</button>
     </div>
+
+    <section id="agcView" class="view" hidden>
+      <div class="agc-grid" id="agcCards"></div>
+      <section class="panel" style="margin-top:14px">
+        <div class="panel-head">
+          <div>
+            <h2>w1 质押中仓位</h2>
+            <p id="agcPosLine">每小时 :07 自动领取到期仓位</p>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="table" id="agcTable">
+            <thead><tr><th>仓位</th><th>份数</th><th>押金 BNB</th><th>铸造时间</th><th>自动领回</th><th>倒计时</th><th class="right">预计 AGC</th></tr></thead>
+            <tbody id="agcRows"><tr><td colspan="7"><div class="skeleton-row"></div></td></tr></tbody>
+          </table>
+        </div>
+      </section>
+      <section class="panel" style="margin-top:14px">
+        <div class="panel-head"><div><h2>自动化规则</h2><p>当前策略与执行链路</p></div></div>
+        <div class="agc-rules" id="agcRules"></div>
+      </section>
+    </section>
 
     <div id="assetsView" class="view">
       <div class="content-grid">
@@ -191,7 +214,9 @@
     <footer class="app-foot">
       <span><svg class="icon"><use href="#i-shield"></use></svg> 私钥不离开币安钱包 · 服务端仅调用 BAW 会话</span>
       <button class="foot-resource" type="button" data-open-resources aria-haspopup="dialog">
-        <svg class="icon"><use href="#i-external"></use></svg> 资源 · 手续费
+        <span class="foot-res-icon"><svg class="icon"><use href="#i-external"></use></svg></span>
+        <span class="foot-res-text"><strong>资源与工具</strong><small>手续费 / 第三方链接</small></span>
+        <svg class="icon foot-res-arrow"><use href="#i-external"></use></svg>
       </button>
       <span>BAW 1.12.0 · BSC · 0xStudy Agentic</span>
     </footer>
